@@ -52,7 +52,7 @@ pub struct LangInfo {
 }
 
 /// The registry. English first: it is the fallback and the source language.
-pub static LANGUAGES: [LangInfo; 19] = [
+pub static LANGUAGES: [LangInfo; 20] = [
     LangInfo { code: "en", name: "English", source: "", prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
     // Simplified Chinese; `zh`, `zh-CN`, `zh-SG` and `zh-Hans-*` resolve here (see `candidates`).
     LangInfo {
@@ -119,8 +119,16 @@ pub static LANGUAGES: [LangInfo; 19] = [
     // Russian; `ru`, `ru-RU`, `ru_RU.UTF-8` and other regions resolve here.
     LangInfo { code: "ru", name: "Русский", source: include_str!("ru.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
     LangInfo { code: "tr", name: "Türkçe", source: include_str!("tr.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
-    // Italian; `it-IT`, `it-CH` and `it-*` resolve here.
-    LangInfo { code: "it", name: "Italiano", source: include_str!("it.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // Italian; `it-IT`, `it-CH` and `it-*` resolve here. New documents are written in
+    // Italian: `wordcraft-proof` checks it (`ProofLang::It`).
+    LangInfo {
+        code: "it",
+        name: "Italiano",
+        source: include_str!("it.tsv"),
+        prefer_hans: false,
+        editing_lang: Some("it-IT"),
+        catalog: OnceLock::new(),
+    },
     // Hungarian; `hu`, `hu-HU` and `hu_HU.UTF-8` resolve here.
     LangInfo { code: "hu", name: "Magyar", source: include_str!("hu.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
     // French; `fr`, `fr-FR`, `fr_CA` and other regions resolve here.
@@ -129,6 +137,8 @@ pub static LANGUAGES: [LangInfo; 19] = [
     LangInfo {
         code: "bg", name: "Български", source: include_str!("bg.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new()
     },
+    // Vietnamese; `vi`, `vi-VN` and `vi_VN.UTF-8` resolve here.
+    LangInfo { code: "vi", name: "Tiếng Việt", source: include_str!("vi.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
 ];
 
 impl LangInfo {

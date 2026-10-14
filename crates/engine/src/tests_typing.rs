@@ -50,6 +50,84 @@ fn typed(keys: &str) -> Session {
 }
 
 #[test]
+fn sample_text_formulas_expand_on_enter() {
+    for name in ["rand", "lorem"] {
+        for (args, paragraphs, sentences) in [("", 5, 3), ("2", 2, 3), ("2,4", 2, 4), ("1,1", 1, 1), ("200,1", 200, 1), ("1,200", 1, 200)] {
+            let mut s = typed(&format!("={name}({args})"));
+            let depth = s.undo_depth();
+            typ(&mut s, "\n");
+            let generated: Vec<_> = paras(&s).into_iter().map(|p| p.0).collect();
+            assert_eq!(generated.len(), paragraphs + 1, "{name}({args})");
+            for text in generated.iter().take(paragraphs) {
+                assert_eq!(text.matches('.').count(), sentences);
+                assert!(text.starts_with(if name == "lorem" { "Lorem ipsum" } else { "A blank page" }), "{name}({args}): {text:?}");
+            }
+            assert_eq!(generated.last().unwrap(), "");
+            assert_eq!(s.sel.focus, Pos::body(paragraphs, 0));
+            assert_eq!(s.undo_depth(), depth + 1);
+            let expanded = s.doc.clone();
+            run(&mut s, "edit.undo", json!({}));
+            assert_eq!(texts(&s), [format!("={name}({args})")]);
+            run(&mut s, "edit.redo", json!({}));
+            assert_eq!(s.doc, expanded);
+        }
+    }
+}
+
+#[test]
+fn sample_text_invalid_parameters_use_defaults() {
+    for name in ["rand", "lorem"] {
+        for args in ["0", "-1", "201", "abc", "1.5", "99999999999999999999999999999", "2,0", "0,4", "2,201", "2,no", "2,", ",4", "1,2,3"] {
+            let s = typed(&format!("={name}({args})\n"));
+            let texts = texts(&s);
+            assert_eq!(texts.len(), 6, "{name}({args})");
+            assert!(texts.iter().take(5).all(|text| text.matches('.').count() == 3));
+        }
+    }
+}
+
+#[test]
+fn sample_text_requires_an_exact_paragraph_and_caret_at_end() {
+    for formula in [" =rand()", "=rand() ", "prefix =rand()", "=lorem() suffix", "=other()", "=rand(", "=rand(())"] {
+        assert_eq!(texts(&typed(&format!("{formula}\n"))), [formula, ""]);
+    }
+    let mut s = typed("=rand()");
+    run(&mut s, "caret.home", json!({}));
+    typ(&mut s, "\n");
+    assert_eq!(texts(&s), ["", "=rand()"]);
+    let mut s = typed("=rand()suffix");
+    s.sel = crate::Selection { anchor: Pos::body(0, 7), focus: Pos::body(0, 13) };
+    typ(&mut s, "\n");
+    assert_eq!(texts(&s), ["=rand()", ""]);
+}
+
+#[test]
+fn sample_text_preserves_typing_and_paragraph_formatting() {
+    let mut s = s();
+    run(&mut s, "format.bold", json!({}));
+    run(&mut s, "para.alignCenter", json!({}));
+    typ(&mut s, "=rand(2,1)\n");
+    for p in s.doc.body.iter().filter_map(|b| b.as_para()).take(2) {
+        assert_eq!(p.props.align, Some(wordcraft_doc::props::Align::Center));
+        assert_eq!(p.props_at(0).bold, Some(true));
+    }
+}
+
+#[test]
+fn sample_text_replacement_tracks_changes() {
+    let mut s = typed("=lorem(2,1)");
+    run(&mut s, "review.trackChanges", json!({}));
+    typ(&mut s, "\n");
+    assert!(s.doc.body.iter().filter_map(|b| b.as_para()).flat_map(|p| &p.runs).any(|r| r.props.ins.is_some()));
+    run(&mut s, "review.rejectAll", json!({}));
+    assert_eq!(texts(&s), ["=lorem(2,1)"]);
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "review.acceptAll", json!({}));
+    assert_eq!(texts(&s).len(), 3);
+    assert!(!s.doc.plain_text(StoryRef::Body).contains("=lorem"));
+}
+
+#[test]
 fn enter_twice_after_a_list_item_ends_the_list() {
     let s = typed("* item\n\ntext");
     assert_eq!(paras(&s), vec![para("Item", Some(0)), para("text", None)]);
@@ -665,6 +743,102 @@ fn alt_x_toggles_between_a_character_and_its_code() {
 }
 
 #[test]
+fn alt_numpad_codes_map_like_word_on_windows() {
+    use crate::cmd::text::{alt_code_char, oem_code_page};
+    let c = |code| alt_code_char(code, 1252, 437);
+    // Leading 0: Windows-1252.
+    assert_eq!(c("0233"), Some('é'));
+    assert_eq!(c("0128"), Some('€'));
+    assert_eq!(c("0150"), Some('–'));
+    assert_eq!(c("065"), Some('A'));
+    assert_eq!(c("0032"), Some(' '));
+    assert_eq!(c("0255"), Some('ÿ'));
+    // No leading 0: the OEM code page (437 here, 850 in Western Europe).
+    assert_eq!(c("233"), Some('Θ'));
+    // The issue said 233 → é in 850; the CP850 mapping file has Ú at 0xE9 (é is 130 in both).
+    assert_eq!(alt_code_char("233", 1252, 850), Some('Ú'));
+    assert_eq!(alt_code_char("130", 1252, 850), Some('é'));
+    assert_eq!(c("130"), Some('é'));
+    assert_eq!(alt_code_char("155", 1252, 850), Some('ø'));
+    assert_eq!(c("155"), Some('¢'));
+    assert_eq!(c("65"), Some('A'));
+    assert_eq!(c("1"), Some('☺'));
+    assert_eq!(c("7"), Some('•'));
+    assert_eq!(c("127"), Some('⌂'));
+    assert_eq!(c("176"), Some('░'));
+    // Above 255: the Unicode character with that decimal value.
+    assert_eq!(c("8364"), Some('€'));
+    assert_eq!(c("09733"), Some('★'));
+    assert_eq!(c("128512"), Some('😀'));
+    // Nothing for junk, 0, control characters, surrogates or values past Unicode.
+    for bad in ["", "0", "000", "0009", "0013", "0127", "0129", "x1", "-5", "55296", "1114112", "99999999999999999999", "4294967361"] {
+        assert_eq!(c(bad), None, "{bad:?}");
+    }
+    assert_eq!(oem_code_page(None), 437);
+    assert_eq!(oem_code_page(Some("en-US")), 437);
+    assert_eq!(oem_code_page(Some("en_GB.UTF-8")), 850);
+    assert_eq!(oem_code_page(Some("fr-FR")), 850);
+    assert_eq!(oem_code_page(Some("de")), 850);
+    assert_eq!(oem_code_page(Some("ru-RU")), 437, "only 437/850 without the shell's code pages");
+}
+
+#[test]
+fn alt_numpad_codes_follow_the_system_code_pages() {
+    use crate::cmd::text::{alt_code_char, windows_code_pages};
+    // Polish (1250/852): Alt+0185 and Alt+165 are both ą, not ¹ / Ñ.
+    assert_eq!(alt_code_char("0185", 1250, 852), Some('ą'));
+    assert_eq!(alt_code_char("165", 1250, 852), Some('ą'));
+    assert_eq!(alt_code_char("0185", 1252, 437), Some('¹'));
+    // Russian (1251/866), Greek (1253/737), Turkish (1254/857).
+    assert_eq!(alt_code_char("0207", 1251, 866), Some('П'));
+    assert_eq!(alt_code_char("143", 1251, 866), Some('П'));
+    assert_eq!(alt_code_char("0193", 1253, 737), Some('Α'));
+    assert_eq!(alt_code_char("128", 1253, 737), Some('Α'));
+    assert_eq!(alt_code_char("0253", 1254, 857), Some('ı'));
+    assert_eq!(alt_code_char("141", 1254, 857), Some('ı'));
+    // Above 255 the code page doesn't matter.
+    assert_eq!(alt_code_char("8364", 1251, 866), Some('€'));
+    // A byte the code page leaves unassigned types nothing.
+    assert_eq!(alt_code_char("213", 1254, 857), None);
+    assert_eq!(alt_code_char("0219", 874, 437), None);
+    assert_eq!(windows_code_pages(None), (1252, 437));
+    assert_eq!(windows_code_pages(Some("en-US")), (1252, 437));
+    assert_eq!(windows_code_pages(Some("de-DE")), (1252, 850));
+    assert_eq!(windows_code_pages(Some("pl-PL")), (1250, 852));
+    assert_eq!(windows_code_pages(Some("sr-Latn-RS")), (1250, 852));
+    assert_eq!(windows_code_pages(Some("ru_RU.UTF-8")), (1251, 866));
+    assert_eq!(windows_code_pages(Some("el-GR")), (1253, 737));
+    assert_eq!(windows_code_pages(Some("tr-TR")), (1254, 857));
+    assert_eq!(windows_code_pages(Some("ja-JP")), (1252, 437));
+}
+
+#[test]
+fn alt_numpad_code_types_one_character() {
+    // `texts` lowercases; the capitals matter here.
+    let raw = |s: &Session| paras(s).into_iter().map(|p| p.0).collect::<Vec<_>>();
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "caf"}));
+    run(&mut s, "text.typeCode", json!({"code": "0233"}));
+    run(&mut s, "text.insert", json!({"text": " "}));
+    run(&mut s, "text.typeCode", json!({"code": "233", "oem": 437}));
+    run(&mut s, "text.insert", json!({"text": " "}));
+    run(&mut s, "text.typeCode", json!({"code": "155", "oem": 850}));
+    assert_eq!(raw(&s), ["Café Θ ø"]);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(raw(&s), ["Café Θ "], "one undo step per code");
+    assert!(s.run("text.typeCode", &json!({"code": "0"})).is_err());
+    assert!(s.run("text.typeCode", &json!({"code": "65", "oem": 855})).is_err());
+    assert!(s.run("text.typeCode", &json!({"code": "065", "ansi": 932})).is_err());
+    assert!(s.run("text.typeCode", &json!({"code": "065", "ansi": 70000})).is_err());
+    assert_eq!(raw(&s), ["Café Θ "]);
+    // The system's code pages: Polish Alt+0185 and Alt+165 both type ą.
+    run(&mut s, "text.typeCode", json!({"code": "0185", "ansi": 1250, "oem": 852}));
+    run(&mut s, "text.typeCode", json!({"code": "165", "ansi": 1250, "oem": 852}));
+    run(&mut s, "text.typeCode", json!({"code": "143", "oem": 866}));
+    assert_eq!(raw(&s), ["Café Θ ąąП"]);
+}
+
+#[test]
 fn shift_f5_goes_back_through_the_last_edits() {
     let mut s = typed("One\nTwo\nThree");
     run(&mut s, "caret.docStart", json!({}));
@@ -840,4 +1014,31 @@ fn typing_rtl_letters_into_an_empty_paragraph_makes_it_rtl() {
     }
     let x = doc.layout().caret(&doc.sel.focus).map(|c| c.x).unwrap_or(f32::MAX);
     assert!(x < 300.0, "left-to-right paragraph: caret at {x}");
+}
+
+/// #898: a click just after a citation at the end of a paragraph puts the caret before the
+/// citation's hidden field end; what is typed there goes after the citation, as in Word, instead
+/// of into its result (Zotero then reports the citation as edited by hand).
+#[test]
+fn typing_after_a_citation_goes_outside_its_field() {
+    use wordcraft_doc::props::CharProps;
+    use wordcraft_doc::{InlineObject, Path};
+    let mut doc = wordcraft_doc::Document::from_text("Cats purr ");
+    let c = CharProps::default();
+    let p = doc.para_mut(StoryRef::Body, &Path::top(0)).unwrap();
+    let start = p.len();
+    p.insert_object(start, InlineObject::FieldStart { instr: "ADDIN ZOTERO_ITEM CSL_CITATION {}".into(), locked: false }, &c).unwrap();
+    let n = p.insert_text(p.len(), "(Smith 2020)", &c).unwrap();
+    p.insert_object(start + 3 + n, InlineObject::FieldEnd, &c).unwrap();
+    let mut s = Session::new(doc);
+    let end = Pos::body(0, s.doc.para(StoryRef::Body, &Path::top(0)).unwrap().len());
+    let at = s.layout().caret(&end).unwrap();
+    let hit = s.layout().hit(at.page, at.x + 20.0, at.top + at.height / 2.0, StoryRef::Body).unwrap();
+    s.sel = crate::Selection::caret(hit);
+    typ(&mut s, ". Dogs bark.");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "Cats purr (Smith 2020). Dogs bark.");
+    let f = s.doc.field_ranges(StoryRef::Body);
+    assert_eq!(f.len(), 1);
+    let inside = Pos { off: f[0].start.off + wordcraft_doc::para::OBJ.len_utf8(), ..f[0].start.clone() };
+    assert_eq!(s.doc.copy_range(&inside, &f[0].end).plain_text(), "(Smith 2020)");
 }

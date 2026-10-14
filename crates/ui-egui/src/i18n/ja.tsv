@@ -120,6 +120,7 @@
 	More templates →	その他のテンプレート →
 	New comments and tracked changes are recorded under this name and these initials.	新しいコメントと変更履歴は、この名前とイニシャルで記録されます。
 	New word	新しい単語
+	No document is open. Create a document or open one first.	開いている文書がありません。先に文書を作成するか開いてください。
 	No templates match your search.	検索に一致するテンプレートはありません。
 	No words yet. Add to Dictionary on a misspelled word puts it here.	まだ単語はありません。スペルミスの単語で [辞書に追加] を選ぶと、ここに追加されます。
 	Nothing	なし
@@ -950,6 +951,7 @@
 	Word Count	文字カウント
 	Word document (*.docx)	Word 文書 (*.docx)
 	Word XML Document (*.xml)	Word XML ドキュメント (*.xml)
+	Word 2003 XML Document (*.xml)	Word 2003 XML ドキュメント (*.xml)
 	Word Left	前の単語へ
 	Word Right	次の単語へ
 	WordArt	ワードアート
@@ -1407,6 +1409,7 @@
 	Demote	レベル下げ
 	Go Back	前の編集位置に戻る
 	Toggle Unicode Character	Unicode 文字の切り替え
+	Type Character Code	文字コードの入力
 	Toggle Field Codes	フィールドコードの表示切り替え
 	Edit Field Code	フィールドコードの編集
 	Unlink Fields	フィールドのリンク解除
@@ -1419,7 +1422,8 @@
 	Formatted	書式変更
 	Deleted	削除
 	Interface size:	表示サイズ:
-	Makes the ribbon, menus and dialogs larger or smaller, on top of your system's display scaling. Document zoom is separate.	リボン、メニュー、ダイアログを、システムの表示倍率に加えて拡大または縮小します。文書のズームは別に設定します。
+	Auto ({percent}%)	自動 ({percent}%)
+	Makes the ribbon, menus and dialogs larger or smaller. Auto follows your system's display scaling; 100% is one screen pixel per point. Document zoom is separate.	リボン、メニュー、ダイアログを拡大または縮小します。自動はシステムの表示倍率に従います。100% は 1 ポイントあたり画面の 1 ピクセルです。文書のズームは別に設定します。
 	Resize Table by Dragging	ドラッグで表のサイズを変更
 	Print Markup	変更履歴とコメントを印刷
 	Comments beside each page and tracked changes in PDFs, prints and images; a comment list at the end of web pages, Markdown and text.	PDF、印刷、画像では各ページの横にコメントと変更履歴を表示し、Web ページ、Markdown、テキストでは末尾にコメント一覧を付けます。
@@ -2026,6 +2030,7 @@
 	Hyphenation Options…	ハイフネーションのオプション…
 	Hyphenation zone:	ハイフネーション領域:
 	Italian	イタリア語
+	Croatian	クロアチア語
 	Japanese	日本語
 	Korean	韓国語
 	Limit consecutive hyphens to:	連続するハイフンの上限:
@@ -2075,3 +2080,37 @@
 	Start-up	起動
 	Show the Start screen when WordCraft starts	WordCraft の起動時にスタート画面を表示する
 	On: WordCraft opens on File › Home, with a blank document, the templates and your recent documents. Off: it opens a blank document.	オン: WordCraft は [ファイル] › [ホーム] で開き、白紙の文書、テンプレート、最近使った文書を表示します。オフ: 白紙の文書を開きます。
+	Privacy Options	プライバシー オプション
+	Trust Center	セキュリティ センター
+	Privacy for this document	このドキュメントのプライバシー
+	Remove my name from comments, changes and file properties when saving	保存時にコメント、変更、ファイルのプロパティから自分の名前を削除する
+	Leave out the date and time of comments and tracked changes when saving	保存時にコメントと変更履歴の日時を含めない
+	The document you are editing keeps the names and dates; only the saved file leaves them out.	編集中のドキュメントには名前と日時が残ります。保存したファイルにだけ含まれません。
+	Privacy Settings	現在のプライバシー設定
+	Full Screen	全画面表示
+	Full\nScreen	全画面\n表示
+	Use the browser's full screen (F11)	ブラウザーの全画面表示を使用してください (F11)
+
+# #1128: size labels (Mailings, Layout › Size), status-bar messages, Reading Mode and Go To
+	{name}   {height} × {width} in	{name}   {height} × {width} インチ
+	{name}   {height} × {width} mm	{name}   {height} × {width} mm
+	{width} × {height} mm	{width} × {height} mm
+	{kind}, {columns} × {rows}, {size} ({paper})	{kind}、{columns} × {rows}、{size} ({paper})
+	Researcher needs an online service; WordCraft keeps your documents offline.	リサーチツールにはオンライン サービスが必要です。WordCraft では文書はオフラインのままです。
+	These settings will be used for new documents.	これらの設定は新しい文書に使用されます。
+	can't split at the first row	先頭の行では表を分割できません
+	select two or more cells to merge	結合するセルを 2 つ以上選択してください
+	there is no ink to replay	再生するインクがありません
+	there's no citation after the caret	カーソルの後に引用文献がありません
+	this item is already at the top level	この項目は既に最上位レベルです
+	Envelope #10	封筒 #10
+	Envelope DL	封筒 DL
+	Reading Mode	閲覧モード
+	Column width	列の幅
+	Text size	文字サイズ
+	Edit Document	文書の編集
+	Go to what:	移動先:
+	Type +2 or -1 to move from the page you are on.	現在のページから移動するには +2 や -1 のように入力します。
+	Suggested	おすすめ
+	Set Proofing Language…	校正言語の設定…
+	Language Preferences…	言語の設定…

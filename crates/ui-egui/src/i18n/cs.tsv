@@ -301,6 +301,7 @@
 	Deletions:	Odstranění:
 	Description:	Popis:
 	Design	Návrh
+	No document is open. Create a document or open one first.	Není otevřen žádný dokument. Nejprve dokument vytvořte nebo otevřete.
 	development build	vývojové sestavení
 	Diagonal	Diagonální
 	Diamond	Kosočtverec
@@ -1342,6 +1343,7 @@
 	Demote	Snížit úroveň
 	Go Back	Přejít zpět
 	Toggle Unicode Character	Přepnout znak Unicode
+	Type Character Code	Zadat kód znaku
 	Toggle Field Codes	Přepnout kódy polí
 	Edit Field Code	Upravit kód pole
 	Unlink Fields	Zrušit propojení polí
@@ -1353,7 +1355,8 @@
 	Edit Field…	Upravit pole…
 	Formatted	Formátováno
 	Interface size:	Velikost rozhraní:
-	Makes the ribbon, menus and dialogs larger or smaller, on top of your system's display scaling. Document zoom is separate.	Zvětší nebo zmenší pás karet, nabídky a dialogová okna nad rámec škálování displeje v systému. Lupa dokumentu se nastavuje zvlášť.
+	Auto ({percent}%)	Automaticky ({percent}%)
+	Makes the ribbon, menus and dialogs larger or smaller. Auto follows your system's display scaling; 100% is one screen pixel per point. Document zoom is separate.	Zvětší nebo zmenší pás karet, nabídky a dialogová okna. Automaticky sleduje škálování displeje v systému; 100% je jeden pixel obrazovky na bod. Lupa dokumentu se nastavuje zvlášť.
 	In Line with Text	V řádku s textem
 	Square	Čtverec
 	Through	Průchozí
@@ -1646,6 +1649,7 @@
 	Hyphenation Options…	Možnosti dělení slov…
 	Hyphenation zone:	Pásmo dělení slov:
 	Italian	Italština
+	Croatian	Chorvatština
 	Japanese	Japonština
 	Korean	Korejština
 	Limit consecutive hyphens to:	Omezit počet po sobě jdoucích rozdělení:
@@ -1876,6 +1880,7 @@
 	Animate the caret (it glides and fades)	Animovat kurzor (plynule se přesouvá a prolíná)
 	On: the caret glides to its new place when you type or use the arrow keys, and its blink fades. Off: it jumps and blinks on and off.	Zapnuto: kurzor se při psaní nebo použití kláves se šipkami plynule přesune na nové místo a jeho blikání se prolíná. Vypnuto: kurzor přeskakuje a blikání se ostře zapíná a vypíná.
 	Word XML Document (*.xml)	Dokument Word XML (*.xml)
+	Word 2003 XML Document (*.xml)	Dokument Word 2003 XML (*.xml)
 	Deleted	Odstraněno
 	Resize Table by Dragging	Změnit velikost tabulky přetažením
 	Select Column	Vybrat sloupec
@@ -2080,3 +2085,37 @@
 	Automatic ({region})	Automaticky ({region})
 	Search	Hledat
 	Title Bar	Záhlaví okna
+	Privacy Options	Možnosti ochrany osobních údajů
+	Trust Center	Centrum zabezpečení
+	Privacy for this document	Soukromí tohoto dokumentu
+	Remove my name from comments, changes and file properties when saving	Při ukládání odebrat mé jméno z komentářů, změn a vlastností souboru
+	Leave out the date and time of comments and tracked changes when saving	Při ukládání vynechat datum a čas komentářů a sledovaných změn
+	The document you are editing keeps the names and dates; only the saved file leaves them out.	Upravovaný dokument si jména a data ponechá; vynechá je jen uložený soubor.
+	Privacy Settings	Aktuální nastavení soukromí
+	Full Screen	Celá obrazovka
+	Full\nScreen	Celá\nobrazovka
+	Use the browser's full screen (F11)	Použijte celou obrazovku prohlížeče (F11)
+
+# #1128: size labels (Mailings, Layout › Size), status-bar messages, Reading Mode and Go To
+	{name}   {height} × {width} in	{name}   {height} × {width} palce
+	{name}   {height} × {width} mm	{name}   {height} × {width} mm
+	{width} × {height} mm	{width} × {height} mm
+	{kind}, {columns} × {rows}, {size} ({paper})	{kind}, {columns} × {rows}, {size} ({paper})
+	Researcher needs an online service; WordCraft keeps your documents offline.	Výzkumník potřebuje online službu; WordCraft vaše dokumenty uchovává offline.
+	These settings will be used for new documents.	Tato nastavení se použijí pro nové dokumenty.
+	can't split at the first row	tabulku nelze rozdělit na prvním řádku
+	select two or more cells to merge	vyberte ke sloučení dvě nebo více buněk
+	there is no ink to replay	není žádný rukopis k přehrání
+	there's no citation after the caret	za kurzorem není žádná citace
+	this item is already at the top level	tato položka už je na nejvyšší úrovni
+	Envelope #10	Obálka č. 10
+	Envelope DL	Obálka DL
+	Reading Mode	Režim čtení
+	Column width	Šířka sloupce
+	Text size	Velikost textu
+	Edit Document	Upravit dokument
+	Go to what:	Přejít na:
+	Type +2 or -1 to move from the page you are on.	Zadáním +2 nebo -1 se posunete od aktuální stránky.
+	Suggested	Navrhované
+	Set Proofing Language…	Nastavit jazyk kontroly pravopisu…
+	Language Preferences…	Předvolby jazyka…
