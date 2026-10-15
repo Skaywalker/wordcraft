@@ -18,8 +18,10 @@
 //! stem is a word only in its own letter case), input conversion (`ICONV`: ligatures such as `ﬁ`
 //! read as `fi`) and ignored characters (`IGNORE`), and the suggestion tables `TRY`, `KEY`, `MAP`
 //! and `REP`.
-//! Morphological data (`AM` aliases, the fields after a stem) is skipped. Rejected: compounding,
-//! long or numeric flags, `NEEDAFFIX` and the other directives that change which words are correct.
+//! Morphological data (`AM` aliases, the fields after a stem) is skipped. Stems marked
+//! `NEEDAFFIX` are words only with an affix, and compound words and word breaks follow
+//! [`compound`]. Rejected: long or numeric flags, `CIRCUMFIX`, `FULLSTRIP`, `COMPLEXPREFIXES`
+//! and `CHECKSHARPS`, which change which words are correct in ways this engine doesn't implement.
 //!
 //! Lookups never panic: stems sit in one string, found through an open-addressing hash table, and
 //! a probe allocates only small scratch strings for the candidate roots it tries.
@@ -29,6 +31,10 @@ use std::hash::Hasher;
 
 use crate::patterns::{FxHasher, FxMap};
 
+mod compound;
+
+use compound::Compounding;
+
 const MAGIC: &str = "WCAFF1";
 /// Longest word (in bytes) looked up; longer input is never a dictionary word.
 pub const MAX_WORD_BYTES: usize = 120;
@@ -36,23 +42,7 @@ pub const MAX_WORD_BYTES: usize = 120;
 const EMPTY: u32 = u32::MAX;
 
 /// Directives that change which words are correct in ways this engine doesn't implement.
-const UNSUPPORTED: &[&str] = &[
-    "CHECKSHARPS",
-    "CIRCUMFIX",
-    "COMPLEXPREFIXES",
-    "COMPOUNDBEGIN",
-    "COMPOUNDEND",
-    "COMPOUNDFLAG",
-    "COMPOUNDMIDDLE",
-    "COMPOUNDMIN",
-    "COMPOUNDPERMITFLAG",
-    "COMPOUNDRULE",
-    "FULLSTRIP",
-    "NEEDAFFIX",
-    "OCONV",
-    "ONLYINCOMPOUND",
-    "PSEUDOROOT",
-];
+const UNSUPPORTED: &[&str] = &["CHECKSHARPS", "CIRCUMFIX", "COMPLEXPREFIXES", "FULLSTRIP", "OCONV"];
 
 /// Most distinct flags a dictionary may use: every single-byte flag (the Hungarian dictionary
 /// uses 158).
@@ -82,11 +72,6 @@ impl Mask {
     fn meets(self, other: Mask) -> bool {
         !(self & other).is_empty()
     }
-
-    /// Does this set hold every flag of `other`?
-    fn covers(self, other: Mask) -> bool {
-        (self & other) == other
-    }
 }
 
 impl std::ops::BitAnd for Mask {
@@ -103,6 +88,16 @@ impl std::ops::BitOr for Mask {
     type Output = Mask;
     fn bitor(mut self, o: Mask) -> Mask {
         self |= o;
+        self
+    }
+}
+
+impl std::ops::Not for Mask {
+    type Output = Mask;
+    fn not(mut self) -> Mask {
+        for a in self.0.iter_mut() {
+            *a = !*a;
+        }
         self
     }
 }
@@ -218,6 +213,35 @@ struct SfxGroup {
     rules: Vec<u32>,
 }
 
+/// One way a word is a stem with affixes: the stem's flags (whatever they are; callers decide
+/// what counts) and the rules taken off, the outer suffix first.
+#[derive(Clone, Copy, Debug)]
+struct Parse<'r> {
+    stem: Mask,
+    prefix: Option<&'r Rule>,
+    suffixes: [Option<&'r Rule>; 2],
+}
+
+impl Parse<'_> {
+    fn affixed(&self) -> bool {
+        self.prefix.is_some() || self.suffixes[0].is_some()
+    }
+
+    fn suffix_rules(&self) -> impl Iterator<Item = &Rule> {
+        self.suffixes.iter().flatten().copied()
+    }
+
+    /// Continuation classes of every affix taken off.
+    fn conts(&self) -> Mask {
+        self.prefix.iter().copied().chain(self.suffix_rules()).fold(Mask::EMPTY, |m, r| m | r.cont)
+    }
+
+    /// Continuation classes of the outermost affix (the outer suffix, else the prefix).
+    fn outer_cont(&self) -> Mask {
+        self.suffixes[0].or(self.prefix).map_or(Mask::EMPTY, |r| r.cont)
+    }
+}
+
 /// A stem list with affix rules (see the module docs).
 #[derive(Clone, Debug, Default)]
 pub struct AffixDict {
@@ -252,6 +276,10 @@ pub struct AffixDict {
     iconv: Vec<(String, String)>,
     /// `IGNORE`: characters removed from input words (and from the stems and affixes).
     ignore: Box<[char]>,
+    /// Compounding, `NEEDAFFIX` and `BREAK` (see [`compound`]).
+    compound: Compounding,
+    /// The directives `compound` was built from, kept for [`AffixDict::to_bytes`].
+    compound_lines: Vec<String>,
     /// Provenance and licence lines, kept through [`AffixDict::to_bytes`].
     comments: Vec<String>,
 }
@@ -326,6 +354,10 @@ struct Rules {
     ignore: Vec<char>,
     /// `AF` flag aliases: alias `n` (1-based) stands for `aliases[n - 1]`.
     aliases: Vec<String>,
+    /// Compounding, `NEEDAFFIX` and `BREAK` directives, one line each (see [`compound`]).
+    compound_lines: Vec<String>,
+    /// `AM` morphological aliases: alias `n` (1-based) stands for `morph_aliases[n - 1]`.
+    morph_aliases: Vec<String>,
 }
 
 impl Rules {
@@ -380,11 +412,19 @@ fn parse_aff(aff: &str) -> Result<Rules, String> {
     let mut map_header = false;
     let mut rep_header = false;
     let mut af_header = false;
+    let mut am_header = false;
     let mut iconv_header = false;
+    let mut tables = compound::TableHeaders::default();
     for (n, line) in aff.lines().enumerate() {
         let f: Vec<&str> = split_fields(line).collect();
         let Some(&dir) = f.first() else { continue };
         if dir.starts_with('#') {
+            continue;
+        }
+        if compound::DIRECTIVES.contains(&dir) {
+            if let Some(l) = tables.line(&f) {
+                r.compound_lines.push(l);
+            }
             continue;
         }
         let at = |k: usize| f.get(k).copied().unwrap_or("");
@@ -393,7 +433,14 @@ fn parse_aff(aff: &str) -> Result<Rules, String> {
             | "SUGSWITHDOTS" | "WARN" | "FORBIDWARN" | "MAXCPDSUGS" => {}
             // Morphological aliases, and flags that only matter for morphological generation
             // and suggestions: the words they mark are correct.
-            "AM" | "SUBSTANDARD" | "LEMMA_PRESENT" => {}
+            "SUBSTANDARD" | "LEMMA_PRESENT" => {}
+            "AM" => {
+                if !am_header && f.len() == 2 && at(1).parse::<usize>().is_ok() {
+                    am_header = true;
+                } else {
+                    r.morph_aliases.push(f.get(1..).unwrap_or_default().join(" "));
+                }
+            }
             "AF" => {
                 if !af_header && f.len() == 2 && at(1).parse::<usize>().is_ok() {
                     af_header = true;
@@ -493,10 +540,23 @@ impl AffixDict {
         // directive or turn the `.dic` count line into a stem.
         let aff = aff.strip_prefix('\u{feff}').unwrap_or(aff);
         let dic = dic.strip_prefix('\u{feff}').unwrap_or(dic);
-        let rules = parse_aff(aff)?;
+        let mut rules = parse_aff(aff)?;
+        let vowels = compound::syllable_vowels(&rules.compound_lines);
+        let morph_aliases = std::mem::take(&mut rules.morph_aliases);
         let mut stems: Vec<(String, String)> = Vec::new();
         for (n, line) in dic.lines().enumerate() {
-            let Some(tok) = split_fields(line).next() else { continue };
+            // A tab ends the entry, which may then hold spaces (`ipso facto`, a phrase that is
+            // never one word); without a tab the first space does. Morphological fields follow.
+            let (tok, morph) = match line.split_once('\t') {
+                Some((entry, morph)) => (entry.trim_matches(' '), morph.trim()),
+                None => {
+                    let line = line.trim_start_matches(' ');
+                    line.split_once(' ').map_or((line, ""), |(entry, morph)| (entry, morph.trim()))
+                }
+            };
+            if tok.is_empty() {
+                continue;
+            }
             if n == 0 && tok.parse::<usize>().is_ok() {
                 continue;
             }
@@ -521,7 +581,22 @@ impl AffixDict {
             if word.is_empty() || word.len() > MAX_WORD_BYTES || word.contains(['\n', '/']) {
                 continue;
             }
-            let flags = rules.flags(&flags).map_err(|e| format!(".dic line {}: {e}", n + 1))?.to_string();
+            let mut flags = rules.flags(&flags).map_err(|e| format!(".dic line {}: {e}", n + 1))?.to_string();
+            // An inflected form listed as a stem (`falevelek`, lemma `falevél`): its extra
+            // syllables are inflection, which the 6–3 rule doesn't count.
+            if let Some(v) = &vowels {
+                let morph = match morph.parse::<usize>().ok().and_then(|i| i.checked_sub(1)).and_then(|i| morph_aliases.get(i)) {
+                    Some(m) => m.as_str(),
+                    None => morph,
+                };
+                // Only inflection: a derivation (`ds:`) forms a new word, which counts.
+                if let Some(lemma) = split_fields(morph).find_map(|f| f.strip_prefix("st:"))
+                    && !split_fields(morph).any(|f| f.starts_with("ds:"))
+                {
+                    let count = |s: &str| s.chars().filter(|c| v.contains(c)).count();
+                    flags.extend(compound::lemma_flag(count(&word).saturating_sub(count(lemma))));
+                }
+            }
             stems.push((word, flags));
         }
         AffixDict::build(rules, stems, comments.iter().map(|s| s.to_string()).collect())
@@ -539,6 +614,10 @@ impl AffixDict {
         let bit_of = |c: char| flag_chars.iter().position(|&x| x == c).map_or(Mask::EMPTY, Mask::bit);
         let forbidden = rules.forbidden.map_or(Mask::EMPTY, bit_of);
         let keepcase = rules.keepcase.map_or(Mask::EMPTY, bit_of);
+        let compound = Compounding::from_lines(&rules.compound_lines, &bit_of)?;
+        // `NEEDAFFIX` and `ONLYINCOMPOUND` describe one entry; merged homonyms keep them only
+        // when every entry has them (`üzelm` needs an affix, a plain homonym wouldn't).
+        let status = compound.need_affix | compound.only_in;
         // Stems sorted by bytes; homonyms (the same word twice) are merged.
         stems.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         let mut d = AffixDict {
@@ -548,6 +627,8 @@ impl AffixDict {
             forbidden,
             no_suggest: rules.no_suggest.map_or(Mask::EMPTY, bit_of),
             keepcase,
+            compound,
+            compound_lines: rules.compound_lines,
             iconv: rules.iconv,
             ignore: rules.ignore.into_boxed_slice(),
             try_chars: rules.try_chars,
@@ -563,13 +644,17 @@ impl AffixDict {
         while i < stems.len() {
             let Some((word, _)) = stems.get(i) else { break };
             let mut mask = Mask::EMPTY;
+            let mut common = status;
             let mut j = i;
             while let Some((w, f)) = stems.get(j)
                 && w == word
             {
-                mask |= f.chars().map(bit_of).fold(Mask::EMPTY, |a, b| a | b);
+                let m = f.chars().map(bit_of).fold(Mask::EMPTY, |a, b| a | b);
+                mask |= m;
+                common = common & m;
                 j += 1;
             }
+            mask = (mask & !status) | common;
             let next_id = u16::try_from(d.sets.len()).map_err(|_| "too many distinct flag sets".to_string())?;
             let id = *set_ids.entry(mask).or_insert(next_id);
             if usize::from(id) == d.sets.len() {
@@ -678,13 +763,13 @@ impl AffixDict {
         (first..self.len()).map_while(move |i| self.word(i).filter(|w| w.starts_with(prefix.as_str())))
     }
 
-    /// Flag mask of a stem, if `w` is one.
+    /// Flag mask of a stem, if `w` is one and is a word (not `FORBIDDENWORD`).
     fn stem_flags(&self, w: &str) -> Option<Mask> {
-        self.stem_flags_except(w, Mask::EMPTY)
+        self.stem_mask(w).filter(|m| !m.meets(self.forbidden))
     }
 
-    /// Flag mask of a stem, if `w` is one and carries none of the flags in `deny`.
-    fn stem_flags_except(&self, w: &str, deny: Mask) -> Option<Mask> {
+    /// Flag mask of a stem, if `w` is one, whatever its flags.
+    fn stem_mask(&self, w: &str) -> Option<Mask> {
         if self.table.is_empty() {
             return None;
         }
@@ -697,37 +782,105 @@ impl AffixDict {
             }
             if self.word(t as usize) == Some(w) {
                 let id = *self.flags.get(t as usize)?;
-                let mask = self.sets.get(usize::from(id)).copied();
-                // A stem carrying FORBIDDENWORD is listed but is not a word: no direct hit,
-                // and (this is the only stem lookup) no affixed form is built on it either.
-                return mask.filter(|m| !m.meets(self.forbidden | deny));
+                return self.sets.get(usize::from(id)).copied();
             }
             slot = (slot + 1) & mask;
         }
         None
     }
 
-    /// Does `w` carry flag `bit` — as a stem, or as the form of a suffix rule whose
-    /// continuation classes include `bit` (chained suffixation, depth-bounded)?
-    fn form_has_flag(&self, w: &str, bit: Mask, depth: u8, deny: Mask) -> bool {
-        if self.stem_flags_except(w, deny).is_some_and(|f| f.meets(bit)) {
-            return true;
-        }
-        if depth == 0 {
+    /// Every way `w` is a stem with affixes, within Hunspell's bounds (a prefix; at most two
+    /// suffixes in a row through continuation classes; a prefix with one suffix when the suffix's
+    /// continuation licenses the prefix or both allow cross products), handed to `f` until it
+    /// returns `true`.
+    fn parses(&self, w: &str, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
+        if w.is_empty() || w.len() > MAX_WORD_BYTES {
             return false;
         }
+        if let Some(stem) = self.stem_mask(w)
+            && f(&Parse { stem, prefix: None, suffixes: [None, None] })
+        {
+            return true;
+        }
+        if self.suffix_parses(w, None, f) {
+            return true;
+        }
         let mut root = String::with_capacity(w.len() + 8);
+        for p in &self.prefixes {
+            let Some(rest) = w.strip_prefix(&*p.add) else { continue };
+            if rest.is_empty() {
+                continue;
+            }
+            root.clear();
+            root.push_str(&p.strip);
+            root.push_str(rest);
+            if !p.cond_matches(&root, false) {
+                continue;
+            }
+            if let Some(stem) = self.stem_mask(&root)
+                && stem.meets(p.bit)
+                && f(&Parse { stem, prefix: Some(p), suffixes: [None, None] })
+            {
+                return true;
+            }
+            if self.suffix_parses(&root, Some(p), f) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The `(base, group)` splits of `w` where a suffix group's appended text ends the word;
+    /// the root is `base` plus the group's stripped text.
+    fn suffix_splits<'a>(&'a self, w: &'a str) -> impl Iterator<Item = (&'a str, &'a SfxGroup)> + 'a {
+        // Each split point from the end: the appended string is `w[b..]`, at most the longest
+        // suffix, and something must stay before it.
         let cuts = std::iter::once(w.len()).chain(w.char_indices().rev().map(|(i, _)| i).filter(|&i| i > 0));
-        for b in cuts.take(self.max_sfx_chars + 1) {
-            let (Some(base), Some(add)) = (w.get(..b), w.get(b..)) else { continue };
-            let Some(groups) = self.sfx_index.get(add) else { continue };
-            for g in groups {
-                root.clear();
-                root.push_str(base);
-                root.push_str(&g.strip);
-                for r in g.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)) {
-                    if r.cont.meets(bit) && r.cond_matches(&root, true) && self.form_has_flag(&root, r.bit, depth - 1, deny) {
-                        return true;
+        cuts.take(self.max_sfx_chars + 1)
+            .filter_map(move |b| {
+                let (base, add) = (w.get(..b)?, w.get(b..)?);
+                Some(self.sfx_index.get(add)?.iter().map(move |g| (base, g)))
+            })
+            .flatten()
+    }
+
+    /// Parses of `w` as a stem with one suffix, or (without a prefix) two in a row.
+    fn suffix_parses<'r>(&'r self, w: &str, prefix: Option<&'r Rule>, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
+        let mut root = String::with_capacity(w.len() + 8);
+        let mut inner = String::with_capacity(w.len() + 8);
+        for (base, g) in self.suffix_splits(w) {
+            root.clear();
+            root.push_str(base);
+            root.push_str(&g.strip);
+            for r1 in g.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)) {
+                if !r1.cond_matches(&root, true) {
+                    continue;
+                }
+                if let Some(stem) = self.stem_mask(&root)
+                    && stem.meets(r1.bit)
+                    && prefix.is_none_or(|p| r1.cont.meets(p.bit) || (p.cross && r1.cross && stem.meets(p.bit)))
+                    && f(&Parse { stem, prefix, suffixes: [Some(r1), None] })
+                {
+                    return true;
+                }
+                if prefix.is_some() {
+                    continue;
+                }
+                // Continuation classes: `root` may itself be a stem with a suffix whose
+                // continuation licenses `r1`.
+                for (base2, g2) in self.suffix_splits(&root) {
+                    inner.clear();
+                    inner.push_str(base2);
+                    inner.push_str(&g2.strip);
+                    for r2 in g2.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)) {
+                        if r2.cont.meets(r1.bit)
+                            && r2.cond_matches(&inner, true)
+                            && let Some(stem) = self.stem_mask(&inner)
+                            && stem.meets(r2.bit)
+                            && f(&Parse { stem, prefix: None, suffixes: [Some(r1), Some(r2)] })
+                        {
+                            return true;
+                        }
                     }
                 }
             }
@@ -735,15 +888,43 @@ impl AffixDict {
         false
     }
 
-    /// Is `w` exactly (case and all) a stem or an affixed form of one? `ICONV` and `IGNORE`
-    /// apply first.
+    /// Is this parse a word on its own? Not when its stem is `FORBIDDENWORD`, in `deny`, or
+    /// `ONLYINCOMPOUND`; not a bare `NEEDAFFIX` stem; not when the outermost affix still needs
+    /// another (`NEEDAFFIX` in its continuation) or an affix may only stand inside compounds.
+    fn standalone(&self, p: &Parse<'_>, deny: Mask) -> bool {
+        let c = &self.compound;
+        if p.stem.meets(self.forbidden | deny | c.only_in) {
+            return false;
+        }
+        if !p.affixed() && p.stem.meets(c.need_affix) {
+            return false;
+        }
+        !p.outer_cont().meets(c.need_affix) && !p.conts().meets(c.only_in)
+    }
+
+    /// Is `w` (normalized) a word without compounding: a stem or an affixed form of one?
+    fn simple(&self, w: &str, deny: Mask) -> bool {
+        self.parses(w, &mut |p| self.standalone(p, deny))
+    }
+
+    /// Is `w` (normalized, case as written) a word: listed and not forbidden, an affixed form,
+    /// or a compound? A stem listed as `FORBIDDENWORD` is wrong however else it could be read.
+    fn is_word(&self, w: &str, deny: Mask) -> bool {
+        if self.stem_mask(w).is_some_and(|m| m.meets(self.forbidden)) {
+            return false;
+        }
+        self.simple(w, deny) || self.compound_word(w, deny)
+    }
+
+    /// Is `w` exactly (case and all) a stem, an affixed form of one or a compound? `ICONV` and
+    /// `IGNORE` apply first.
     pub fn contains(&self, w: &str) -> bool {
-        self.contains_except(&self.normalize(w), Mask::EMPTY)
+        self.is_word(&self.normalize(w), Mask::EMPTY)
     }
 
     /// Exactly spelled dictionary words eligible for suggestions (NOSUGGEST stems excluded).
     pub fn contains_suggestible(&self, w: &str) -> bool {
-        self.contains_except(&self.normalize(w), self.no_suggest)
+        self.is_word(&self.normalize(w), self.no_suggest)
     }
 
     /// `w` after the `ICONV` conversions (at each position the longest match wins) and without
@@ -772,77 +953,13 @@ impl AffixDict {
         std::borrow::Cow::Owned(out)
     }
 
-    /// [`AffixDict::contains`] on normalized input, where stems carrying a flag in `deny` don't
-    /// count (case variants of `KEEPCASE` stems).
-    fn contains_except(&self, w: &str, deny: Mask) -> bool {
-        if w.is_empty() || w.len() > MAX_WORD_BYTES {
-            return false;
-        }
-        if self.stem_flags_except(w, deny).is_some() || self.suffixed(w, Mask::EMPTY, deny) {
-            return true;
-        }
-        let mut root = String::with_capacity(w.len() + 8);
-        for r in &self.prefixes {
-            let Some(rest) = w.strip_prefix(&*r.add) else { continue };
-            if rest.is_empty() {
-                continue;
-            }
-            root.clear();
-            root.push_str(&r.strip);
-            root.push_str(rest);
-            if !r.cond_matches(&root, false) {
-                continue;
-            }
-            if self.stem_flags_except(&root, deny).is_some_and(|f| f.meets(r.bit)) {
-                return true;
-            }
-            if self.form_has_flag(&root, r.bit, INNER_CHAIN, deny) {
-                return true;
-            }
-            if r.cross && self.suffixed(&root, r.bit, deny) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Is `w` a stem with one suffix? With `need` set (a prefix was taken off), the stem must
-    /// carry those flags too and the suffix must allow cross products.
-    fn suffixed(&self, w: &str, need: Mask, deny: Mask) -> bool {
-        let mut root = String::with_capacity(w.len() + 8);
-        // Each split point from the end: the appended string is `w[b..]`, at most the longest
-        // suffix, and something must stay before it.
-        let cuts = std::iter::once(w.len()).chain(w.char_indices().rev().map(|(i, _)| i).filter(|&i| i > 0));
-        for b in cuts.take(self.max_sfx_chars + 1) {
-            let (Some(base), Some(add)) = (w.get(..b), w.get(b..)) else { continue };
-            let Some(groups) = self.sfx_index.get(add) else { continue };
-            for g in groups {
-                root.clear();
-                root.push_str(base);
-                root.push_str(&g.strip);
-                let rules = || g.rules.iter().filter_map(|&i| self.suffixes.get(i as usize));
-                // The stem path: `root` is a stem carrying the rule's flag (and the prefix's,
-                // when a cross product is being checked).
-                if let Some(f) = self.stem_flags_except(&root, deny)
-                    && f.covers(need)
-                    && rules().any(|r| f.meets(r.bit) && (need.is_empty() || r.cross) && r.cond_matches(&root, true))
-                {
-                    return true;
-                }
-                // Continuation classes: `root` need not be a stem carrying this rule's flag —
-                // it may be a form that gained the flag from another rule's continuation.
-                if need.is_empty() && rules().any(|r| r.cond_matches(&root, true) && self.form_has_flag(&root, r.bit, INNER_CHAIN, deny)) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// Is `w` correct, Hunspell style: as written, or — for a capitalized word or one in capitals
     /// — in lower case (and capitalized), since a sentence may start with any word and headings
     /// may be in capitals. Lower-case input never matches a capitalized stem (`warszawa`), and a
-    /// `KEEPCASE` stem matches only as written.
+    /// `KEEPCASE` stem matches only as written; a word in capitals with a hyphen may also be an
+    /// abbreviation with a lower-case ending (`SMS-ET` as `SMS-et`). Each of these readings may
+    /// also be split at its `BREAK` points, its sides then checked as written: `Petőfi-vers` and
+    /// `PETŐFI-VERS` are correct, `SÁMBOKI-HAZAY` (`Sámboki-hazay`) isn't.
     pub fn check(&self, w: &str) -> bool {
         self.check_except(w, Mask::EMPTY)
     }
@@ -854,18 +971,43 @@ impl AffixDict {
 
     fn check_except(&self, w: &str, deny: Mask) -> bool {
         let w = self.normalize(w);
-        if self.contains_except(&w, deny) {
-            return true;
-        }
-        let deny = deny | self.keepcase;
-        match casing(&w) {
-            Casing::Lower | Casing::Mixed => false,
-            Casing::Initial => self.contains_except(&w.to_lowercase(), deny),
+        let mut budget = compound::BREAK_BUDGET;
+        self.case_readings(&w).into_iter().any(|(v, case_deny)| {
+            let deny = deny | case_deny;
+            self.is_word(&v, deny) || self.breaks_ok(&v, deny, &mut budget)
+        })
+    }
+
+    /// The readings of `w` [`AffixDict::check`] tries, with the flags each must not rely on.
+    fn case_readings(&self, w: &str) -> Vec<(String, Mask)> {
+        let mut out = vec![(w.to_string(), Mask::EMPTY)];
+        let deny = self.keepcase;
+        match casing(w) {
+            Casing::Lower | Casing::Mixed => {}
+            Casing::Initial => out.push((w.to_lowercase(), deny)),
             Casing::Upper => {
                 let lower = w.to_lowercase();
-                self.contains_except(&capitalize(&lower), deny) || self.contains_except(&lower, deny)
+                out.push((capitalize(&lower), deny));
+                out.push((lower, deny));
+                if let Some((head, tail)) = w.rsplit_once('-')
+                    && !tail.is_empty()
+                {
+                    out.push((format!("{head}-{}", tail.to_lowercase()), deny));
+                }
             }
         }
+        out
+    }
+
+    /// Is `w`, as written, correct when split at its `BREAK` points? A listed
+    /// `FORBIDDENWORD` stays wrong even when its sides are right (`Rákóczi-híd`).
+    fn breaks_ok(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
+        !self.stem_mask(w).is_some_and(|m| m.meets(self.forbidden)) && self.check_breaks(w, deny, budget)
+    }
+
+    /// One side of a break: a word as written, or one that breaks again.
+    fn side_ok(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
+        self.is_word(w, deny) || self.breaks_ok(w, deny, budget)
     }
 
     /// Every form of the stem `stem` (itself included), unsorted, possibly with repeats.
@@ -990,6 +1132,10 @@ impl AffixDict {
         if !self.ignore.is_empty() {
             out.push_str(&format!("IGNORE {}\n", self.ignore.iter().collect::<String>()));
         }
+        for l in compound::with_table_headers(&self.compound_lines) {
+            out.push_str(&l);
+            out.push('\n');
+        }
         let z = |s: &str| if s.is_empty() { "0".to_string() } else { s.to_string() };
         for (kind, rules) in [("PFX", &self.prefixes), ("SFX", &self.suffixes)] {
             for r in rules {
@@ -1036,6 +1182,7 @@ impl AffixDict {
         }
         let mut rules = Rules::default();
         let mut comments = Vec::new();
+        let mut tables = compound::TableHeaders::default();
         for line in lines {
             if let Some(c) = line.strip_prefix("# ") {
                 comments.push(c.to_string());
@@ -1043,6 +1190,12 @@ impl AffixDict {
             }
             let f: Vec<&str> = split_fields(line).collect();
             let at = |k: usize| f.get(k).copied().unwrap_or("");
+            if compound::DIRECTIVES.contains(&at(0)) {
+                if let Some(l) = tables.line(&f) {
+                    rules.compound_lines.push(l);
+                }
+                continue;
+            }
             match at(0) {
                 "TRY" => rules.try_chars = at(1).to_string(),
                 "KEY" => rules.key = at(1).to_string(),
@@ -1405,7 +1558,7 @@ pub(crate) mod tests {
     fn unsupported_and_broken_input_is_an_error() {
         assert!(AffixDict::from_hunspell("FLAG long\n", DIC, &[]).is_err());
         assert!(AffixDict::from_hunspell("FLAG num\n", DIC, &[]).is_err());
-        assert!(AffixDict::from_hunspell("COMPOUNDFLAG X\n", DIC, &[]).is_err());
+        assert!(AffixDict::from_hunspell("CIRCUMFIX X\n", DIC, &[]).is_err());
         assert!(AffixDict::from_hunspell("SFX a Y 1\nSFX a 0 y [ab\n", DIC, &[]).is_err());
         assert!(AffixDict::from_bytes(b"not deflate").is_err());
         let ok = dict().to_bytes();
