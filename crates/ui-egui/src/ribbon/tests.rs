@@ -243,6 +243,14 @@ fn turkish_has_a_name_in_the_language_menu() {
 }
 
 #[test]
+fn hungarian_has_a_name_in_the_language_menu() {
+    assert!(PROOFING_LANGUAGES.iter().any(|(t, _)| *t == "hu-HU"));
+    assert_eq!(language_name(Some("hu-HU")), "Hungarian");
+    assert_eq!(language_name(Some("hu")), "Hungarian");
+    assert_eq!(language_name(Some("HU-HU")), "Hungarian");
+}
+
+#[test]
 fn picture_format_tab_appears_when_picture_selected() {
     let mut s = Session::new(wordcraft_doc::Document::new());
     assert!(!has_picture_selected(&s));

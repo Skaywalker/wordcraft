@@ -1218,6 +1218,14 @@ impl AffixDict {
         self.is_word(&self.normalize(w), self.no_suggest | self.substandard)
     }
 
+    /// Is `w` exactly (case and all) a stem or an affixed form of one, leaving compounds aside?
+    /// Much cheaper than [`AffixDict::contains`] for a dictionary that compounds, so suggestions
+    /// try it first.
+    pub fn contains_simple(&self, w: &str) -> bool {
+        let w = self.normalize(w);
+        !self.stem_mask(&w).is_some_and(|m| m.meets(self.forbidden)) && self.simple(&w, Mask::EMPTY)
+    }
+
     /// `w` after the `ICONV` conversions (at each position the longest match wins) and without
     /// the `IGNORE` characters.
     fn normalize<'a>(&self, w: &'a str) -> std::borrow::Cow<'a, str> {
