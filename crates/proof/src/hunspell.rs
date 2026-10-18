@@ -321,8 +321,11 @@ fn decode_utf8_aff(aff: &[u8]) -> Result<String, String> {
             continue;
         }
         // A trailing `# comment` (the Hungarian `AF` lines number themselves) is never a word or
-        // a flag; from there on the line is kept as text.
-        let comment_at = words.iter().skip(1).position(|&w| parts.get(w).is_some_and(|f| f.first() == Some(&b'#'))).map(|k| k + 1);
+        // a flag; from there on the line is kept as text. It can only start after the directive's
+        // own fields, since a field such as an affix condition may itself begin with `#`.
+        let field_text = |k: usize| words.get(k).and_then(|&w| parts.get(w)).map(|p| String::from_utf8_lossy(p).into_owned());
+        let first_free = comment_field(&dir, field_text);
+        let comment_at = words.iter().skip(first_free).position(|&w| parts.get(w).is_some_and(|f| f.first() == Some(&b'#'))).map(|k| k + first_free);
         for (i, p) in parts.iter().enumerate() {
             let field = words.iter().position(|&w| w == i);
             let in_comment = comment_at.is_some_and(|c| words.get(c).is_some_and(|&w| i >= w));
@@ -339,6 +342,43 @@ fn decode_utf8_aff(aff: &[u8]) -> Result<String, String> {
     Ok(out)
 }
 
+/// The first field of an `.aff` line where a trailing `# comment` may start: after the
+/// directive's own fields. A table's count line (`REP 12`, `PFX A Y 3`) has fewer fields than its
+/// rows (`REP a b`, `PFX A 0 x .`). `field(k)` is the line's `k`-th field.
+fn comment_field(dir: &str, field: impl Fn(usize) -> Option<String>) -> usize {
+    let number = |k: usize| field(k).is_some_and(|f| f.parse::<usize>().is_ok());
+    match dir {
+        "PFX" | "SFX" if field(2).is_some_and(|f| f == "Y" || f == "N") && number(3) => 4,
+        "PFX" | "SFX" => 5,
+        "REP" | "ICONV" | "OCONV" | "PHONE" | "MAP" | "BREAK" | "AF" | "AM" | "COMPOUNDRULE" | "CHECKCOMPOUNDPATTERN"
+            if number(1) && field(2).is_none_or(|f| f.starts_with('#')) =>
+        {
+            2
+        }
+        "REP" | "ICONV" | "OCONV" | "PHONE" => 3,
+        "CHECKCOMPOUNDPATTERN" => 4,
+        _ => 2,
+    }
+}
+
+/// Where the `word/flags` entry of a `.dic` line ends, as Hunspell reads it: at a tab or at the
+/// first morphological field (a space or tab, two characters and `:`, as in ` po:noun`), whichever
+/// comes first, so an entry may hold spaces (`ad hoc`); with neither, at the first space.
+pub(crate) fn dic_entry_end(line: &[u8]) -> usize {
+    let blank = |b: &u8| matches!(b, b' ' | b'\t');
+    let morph = line.windows(4).position(|w| matches!(w, [a, b, c, b':'] if blank(a) && !blank(b) && !blank(c)));
+    let tab = line.iter().position(|&b| b == b'\t');
+    let end = match (morph, tab) {
+        (Some(m), Some(t)) => m.min(t),
+        (m, t) => match m.or(t) {
+            Some(e) => e,
+            None => line.iter().position(|&b| b == b' ').unwrap_or(line.len()),
+        },
+    };
+    // Spaces before the morphological field aren't part of the entry.
+    line.get(..end).map_or(end, |e| e.iter().rposition(|b| !blank(b)).map_or(0, |k| k + 1))
+}
+
 /// A UTF-8 `.dic` with single-byte flags: the word is UTF-8, the flags after `/` are bytes.
 fn decode_utf8_dic(dic: &[u8]) -> Result<String, String> {
     let mut out = String::with_capacity(dic.len());
@@ -353,8 +393,9 @@ fn decode_utf8_dic(dic: &[u8]) -> Result<String, String> {
             continue;
         }
         let what = format!(".dic line {}", n + 1);
-        // The first field is `word/flags`; morphological fields after it are UTF-8 text.
-        let end = line.iter().position(|b| matches!(b, b' ' | b'\t')).unwrap_or(line.len());
+        // The first field is `word/flags` (it may hold spaces, see [`dic_entry_end`]);
+        // morphological fields after it are UTF-8 text.
+        let end = dic_entry_end(line);
         out.push_str(&text_and_flags(line.get(..end).unwrap_or_default(), &what)?);
         let rest = line.get(end..).unwrap_or_default();
         out.push_str(std::str::from_utf8(rest).map_err(|e| format!("{what}: not UTF-8: {e}"))?);
@@ -433,6 +474,36 @@ mod tests {
         let (_, d) = decode(b"SET microsoft-cp1251\n", b"1\n\xb8\xeb\xea\xe0 \xc4\xee\xec\n").unwrap();
         assert_eq!(d, "1\nёлка Дом\n");
         assert_eq!(decode_high(&[0x98], CP1251_HIGH), "\u{fffd}");
+    }
+
+    #[test]
+    fn comments_start_after_the_directive_fields() {
+        let f = |line: &'static str| move |k: usize| line.split_whitespace().nth(k).map(str::to_string);
+        assert_eq!(comment_field("PFX", f("PFX A Y 3 # count")), 4);
+        assert_eq!(comment_field("SFX", f("SFX A 0 # .")), 5, "a rule's condition may be `#`");
+        assert_eq!(comment_field("AF", f("AF 1234 # aliases")), 2);
+        assert_eq!(comment_field("AF", f("AF Aa # 1")), 2);
+        assert_eq!(comment_field("REP", f("REP 12")), 2);
+        assert_eq!(comment_field("REP", f("REP # x")), 3);
+        assert_eq!(comment_field("CHECKCOMPOUNDPATTERN", f("CHECKCOMPOUNDPATTERN a b c")), 4);
+        assert_eq!(comment_field("KEEPCASE", f("KEEPCASE k")), 2);
+        // A byte flag after an append text that begins with `#` stays a flag, not a comment.
+        let (a, _) = decode(b"SET UTF-8\nSFX \xd5 Y 1 # header\nSFX \xd5 0 #/\xe9 . # rule\n", b"").unwrap();
+        assert!(a.contains("SFX \u{d5} 0 #/\u{e9} . # rule"), "{a}");
+    }
+
+    #[test]
+    fn dic_entries_end_where_hunspell_ends_them() {
+        let end = |l: &str| l.get(..dic_entry_end(l.as_bytes())).unwrap().to_string();
+        assert_eq!(end("word/A po:noun\tts:x"), "word/A", "the morphological field comes before the tab");
+        assert_eq!(end("ad hoc/B\tpo:adv"), "ad hoc/B", "a tab ends a phrase");
+        assert_eq!(end("ad hoc/B po:adv"), "ad hoc/B");
+        assert_eq!(end("word/A 123"), "word/A", "neither: the first space");
+        assert_eq!(end("word"), "word");
+        assert_eq!(end("a:b/A"), "a:b/A", "a colon inside the word isn't a field");
+        // Single-byte flags of a phrase entry are read byte by byte, then the UTF-8 morphology.
+        let (_, d) = decode(b"SET UTF-8\n", b"1\nad hoc/\xe9\tpo:adv\n").unwrap();
+        assert_eq!(d, "1\nad hoc/\u{e9}\tpo:adv\n");
     }
 
     #[test]
