@@ -366,6 +366,9 @@ impl AffixDict {
             } else {
                 Place::Middle
             };
+            // Every candidate costs one unit, looked up before or not, so the cache can't let a
+            // long word try split after split for free.
+            s.budget = s.budget.saturating_sub(1);
             let Some(part) = self.part(s, a, b, place) else { continue };
             if let Some((pa, pb, prev_part)) = prev
                 && !self.boundary_ok(s.w, (pa, pb, prev_part), (a, b, part))
@@ -389,7 +392,6 @@ impl AffixDict {
         if let Some(p) = s.parts.get(&(a, b, place)) {
             return *p;
         }
-        s.budget = s.budget.saturating_sub(1);
         let text = s.w.get(a..b)?;
         let c = &self.compound;
         let mut best: Option<Part> = None;
@@ -435,9 +437,11 @@ impl AffixDict {
             return false;
         }
         // Inside a compound an affix needs `COMPOUNDPERMITFLAG`, unless it carries the compound
-        // flag itself (`kedvez` + `ő` → `kedvezőpocak`).
+        // flag itself (`kedvez` + `ő` → `kedvezőpocak`). A prefix after the first part needs the
+        // compound flag: the Hungarian dictionary puts the permit flag on its verb prefixes, yet
+        // Hunspell rejects a verb with a prefix after a noun (`előanyag` + `elszánt`).
         let inside = c.permit | c.flag | at_place;
-        if place != Place::First && p.prefix.is_some_and(|r| !r.cont.meets(inside)) {
+        if place != Place::First && p.prefix.is_some_and(|r| !r.cont.meets(c.flag | at_place)) {
             return false;
         }
         !(place != Place::Last && p.suffix_rules().any(|r: &Rule| !r.cont.meets(inside)))
@@ -799,6 +803,28 @@ ipso facto\t1
         // No compound flags, no BREAK: neither compounds nor hyphen splits are accepted.
         let d = AffixDict::from_hunspell("SET UTF-8\nSFX a Y 1\nSFX a 0 y .\n", "2\nkot/a\npies/a\n", &[]).unwrap();
         assert!(d.check("koty") && !d.check("kotpies") && !d.check("kot-pies"));
+    }
+
+    #[test]
+    fn flags_only_an_affix_carries_on_still_count() {
+        // `P` (COMPOUNDPERMITFLAG) and `F` (COMPOUNDFORBIDFLAG) appear only after the `/` of a
+        // suffix, on no stem and as no rule's own flag; they must still get a bit, or the
+        // compound rules that test them would never match.
+        let d = AffixDict::from_hunspell(AFF, DIC, &[]).unwrap();
+        assert!(d.flag_chars.contains(&'P') && d.flag_chars.contains(&'F'), "{:?}", d.flag_chars);
+        let back = AffixDict::from_bytes(&d.to_bytes()).unwrap();
+        assert!(back.flag_chars.contains(&'P') && back.flag_chars.contains(&'F'), "the compact format keeps them");
+    }
+
+    #[test]
+    fn a_word_with_countless_splits_ends_quickly() {
+        // Every split of a run of `a`s is a candidate; cached parts must cost budget too, or
+        // the search would try split after split for free.
+        let d = AffixDict::from_hunspell("SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 1\n", "1\na/Y\n", &[]).unwrap();
+        let w = format!("{}x", "a".repeat(60));
+        let t = std::time::Instant::now();
+        assert!(!d.check(&w));
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     proptest::proptest! {
