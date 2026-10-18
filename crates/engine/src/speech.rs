@@ -260,7 +260,7 @@ pub fn speech_language(text: &str, explicit: Option<&str>, bidi: Option<&str>) -
 
 /// The primary language subtag of a plain tag, lowercased (`ru-RU` gives `ru`). `None` for tags
 /// without a two- or three-letter language, such as Word's `x-none`.
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows, target_arch = "wasm32", test))]
 fn primary_tag(tag: &str) -> Option<String> {
     let t = plain_tag(tag)?;
     t.split('-').next().filter(|p| (2..=3).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphabetic())).map(str::to_ascii_lowercase)
@@ -384,6 +384,8 @@ fn mac_default_voice_language() -> &'static str {
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 mod ssip;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 /// Longest voice id kept (ids come from saved settings and commands, hostile input).
 pub(crate) const MAX_VOICE_ID: usize = 200;
@@ -406,6 +408,8 @@ pub enum VoiceKind {
     Mac,
     /// The Windows speech synthesizer: the id is the voice name.
     Windows,
+    /// The browser's speech synthesis: the id is the voice URI.
+    Web,
 }
 
 /// An installed voice Read Aloud can read in.
@@ -428,7 +432,6 @@ impl Voice {
 
 /// Languages written in a script [`detect_language`] doesn't tell apart (Indic, Georgian,
 /// Armenian, Ethiopic, Southeast Asian…): their voices don't read Latin text.
-#[cfg(any(not(target_arch = "wasm32"), test))]
 const OTHER_SCRIPT_LANGUAGES: &[&str] = &[
     "hi", "mr", "ne", "sa", "bn", "as", "pa", "gu", "or", "ta", "te", "kn", "ml", "si", "ka", "hy", "am", "ti", "km", "lo", "my", "bo", "dz", "dv",
     "iu",
@@ -439,7 +442,6 @@ const OTHER_SCRIPT_LANGUAGES: &[&str] = &[
 /// in a formula doesn't make a Hungarian sentence Greek. Modifier letters (`ʼ`) and the micro sign
 /// count for no script. Text without letters (`2026`, `3.14`) is no Latin text: [`voice_for`]
 /// decides it by its tag.
-#[cfg(any(not(target_arch = "wasm32"), test))]
 fn is_latin_text(text: &str) -> bool {
     let (mut latin, mut other) = (0usize, 0usize);
     for c in text.chars().filter(|c| c.is_alphabetic()) {
@@ -461,7 +463,6 @@ fn is_latin_text(text: &str) -> bool {
 /// included); text in another script keeps the voice of its language, so a Hungarian voice
 /// doesn't spell out a Russian or Hindi sentence letter by letter, and a Hindi voice doesn't read
 /// English.
-#[cfg(any(not(target_arch = "wasm32"), test))]
 fn voice_for<'a>(voice: Option<&'a Voice>, lang: Option<&str>, text: &str) -> Option<&'a Voice> {
     let voice = voice?;
     // A language as a program writes it: `hu`, `en-gb`, `ru_RU`, `cmn-latn-pinyin`.
@@ -766,7 +767,18 @@ fn installed_voices() -> Option<Arc<[Voice]>> {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        Some(Arc::new([]))
+        // Browsers load their voices after the page; until they arrive (or a while has passed
+        // without any), the list is pending.
+        static WEB_VOICES: std::sync::OnceLock<Arc<[Voice]>> = std::sync::OnceLock::new();
+        static ASKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if let Some(v) = WEB_VOICES.get() {
+            return Some(Arc::clone(v));
+        }
+        let list = web::voices();
+        if list.is_empty() && ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+            return None;
+        }
+        Some(Arc::clone(WEB_VOICES.get_or_init(|| list.into())))
     }
 }
 
@@ -1249,13 +1261,12 @@ impl ReadAloud {
         })
     }
 
+    /// In the browser there is no worker thread: the browser's speech synthesis speaks the
+    /// current sentence, and its end event moves on ([`web`]).
     #[cfg(target_arch = "wasm32")]
     fn ensure_worker(&mut self) {
-        let (m, _) = &*self.shared;
-        let mut s = lock(m);
-        if s.state == State::Playing && self.backend == Backend::System {
-            s.state = State::Stopped;
-            s.error = Some("Read Aloud isn't available in the browser".into());
+        if self.backend == Backend::System {
+            web::sync(&self.shared);
         }
     }
 
@@ -1278,11 +1289,17 @@ impl ReadAloud {
 
 impl Drop for ReadAloud {
     fn drop(&mut self) {
-        let (m, cv) = &*self.shared;
-        let mut s = lock(m);
-        s.state = State::Stopped;
-        s.generation = s.generation.wrapping_add(1);
-        cv.notify_all();
+        {
+            let (m, cv) = &*self.shared;
+            let mut s = lock(m);
+            s.state = State::Stopped;
+            s.generation = s.generation.wrapping_add(1);
+            cv.notify_all();
+        }
+        #[cfg(target_arch = "wasm32")]
+        if self.backend == Backend::System {
+            web::cancel();
+        }
     }
 }
 
