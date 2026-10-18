@@ -549,15 +549,12 @@ impl AffixDict {
         let morph_aliases = std::mem::take(&mut rules.morph_aliases);
         let mut stems: Vec<(String, String)> = Vec::new();
         for (n, line) in dic.lines().enumerate() {
-            // A tab ends the entry, which may then hold spaces (`ipso facto`, a phrase that is
-            // never one word); without a tab the first space does. Morphological fields follow.
-            let (tok, morph) = match line.split_once('\t') {
-                Some((entry, morph)) => (entry.trim_matches(' '), morph.trim()),
-                None => {
-                    let line = line.trim_start_matches(' ');
-                    line.split_once(' ').map_or((line, ""), |(entry, morph)| (entry, morph.trim()))
-                }
-            };
+            // The entry ends where Hunspell ends it ([`crate::hunspell::dic_entry_end`]): at a tab
+            // or the first morphological field (` po:noun`), so it may hold spaces (`ipso facto`,
+            // a phrase that is never one word); with neither, at the first space.
+            let line = line.trim_start_matches(' ');
+            let end = crate::hunspell::dic_entry_end(line.as_bytes());
+            let (tok, morph) = (line.get(..end).unwrap_or(line).trim_matches(' '), line.get(end..).unwrap_or("").trim());
             if tok.is_empty() {
                 continue;
             }
@@ -607,8 +604,10 @@ impl AffixDict {
     }
 
     fn build(rules: Rules, mut stems: Vec<(String, String)>, comments: Vec<String>) -> Result<AffixDict, String> {
-        // Flags: every one a rule or a stem uses gets a bit.
+        // Flags: every one a rule, a rule's continuation classes or a stem uses gets a bit. A flag
+        // only an affix carries on (`NEEDAFFIX`, `COMPOUNDPERMITFLAG` on a suffix) counts too.
         let mut flag_chars: Vec<char> = rules.prefixes.iter().chain(&rules.suffixes).map(|r| r.0).collect();
+        flag_chars.extend(rules.prefixes.iter().chain(&rules.suffixes).flat_map(|r| r.4.chars()));
         flag_chars.extend(stems.iter().flat_map(|s| s.1.chars()));
         flag_chars.sort_unstable();
         flag_chars.dedup();
