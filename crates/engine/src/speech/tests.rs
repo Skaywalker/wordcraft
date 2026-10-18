@@ -271,6 +271,24 @@ fn espeak_gets_the_language() {
     assert_eq!(espeak_args("180", Some("uk")), ["-s", "180", "-v", "uk", "--stdin"]);
     assert_eq!(espeak_args("180", None), ["-s", "180", "--stdin"]);
     assert_eq!(espeak_args("180", Some("--evil")), ["-s", "180", "--stdin"]);
+    assert_eq!(espeak_args("180", Some("hu-HU")), ["-s", "180", "-v", "hu", "--stdin"]);
+}
+
+#[test]
+fn speech_dispatcher_gets_the_speed_and_the_language() {
+    assert_eq!(spd_rate(1.0), 0);
+    assert_eq!(spd_rate(MIN_RATE), -50);
+    assert_eq!(spd_rate(MAX_RATE), 100);
+    assert_eq!(spd_rate(2.0), 50);
+    assert_eq!(spd_rate(10.0), 100);
+    assert_eq!(spd_rate(0.0), -50);
+    assert_eq!(spd_rate(f32::NAN), 0);
+    assert_eq!(spd_args(1.0, Some("hu-HU")), ["-w", "-e", "-r", "0", "-l", "hu"]);
+    // Speech Dispatcher's default language is its own setting, so English is named too.
+    assert_eq!(spd_args(2.0, Some("en-US")), ["-w", "-e", "-r", "50", "-l", "en"]);
+    assert_eq!(spd_args(1.0, None), ["-w", "-e", "-r", "0"]);
+    assert_eq!(spd_args(1.0, Some("--evil")), ["-w", "-e", "-r", "0"]);
+    assert_eq!(spd_args(1.0, Some("x-none")), ["-w", "-e", "-r", "0"]);
 }
 
 #[test]

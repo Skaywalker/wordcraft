@@ -12,9 +12,9 @@
 //! stays whenever it already speaks the language (English text on an English system keeps the
 //! voice the user chose), and without a voice for the language the default voice speaks.
 //!
-//! The speech itself runs on a worker thread (desktop only): it starts `say` (macOS), `espeak`
-//! / `spd-say` (Linux, BSD) or the Windows speech synthesizer (PowerShell) for the current
-//! sentence, and moves on when it finishes. Commands only change the shared state and wake the
+//! The speech itself runs on a worker thread (desktop only): it starts `say` (macOS), `espeak-ng`
+//! / `espeak` or else Speech Dispatcher's `spd-say` (Linux, BSD) or the Windows speech synthesizer
+//! (PowerShell) for the current sentence, and moves on when it finishes. Commands only change the shared state and wake the
 //! worker, which stops the running sentence when the state changed under it.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -370,6 +370,40 @@ fn mac_default_voice_language() -> &'static str {
         let locale = read(&["read", "-g", "AppleLocale"]).or_else(|| std::env::var("LANG").ok());
         mac_default_language(voice.as_deref(), mac_voice_listing(), locale.as_deref())
     })
+}
+
+/// Speech Dispatcher's command-line client.
+#[cfg(not(target_arch = "wasm32"))]
+const SPD_SAY: &str = "spd-say";
+
+/// What Read Aloud says when the system has none of the speech programs it knows.
+#[cfg(not(target_arch = "wasm32"))]
+const MISSING_PROGRAM: &str = if cfg!(all(unix, not(target_os = "macos"))) {
+    "Read Aloud needs a speech program: install espeak-ng or Speech Dispatcher (spd-say) from your distribution's packages"
+} else {
+    "Read Aloud couldn't find the system's speech program"
+};
+
+/// Read Aloud's speed (1 = normal) as Speech Dispatcher's rate, -100 to 100 with 0 the voice's
+/// normal speed: the slowest speed is -50 and the fastest 100.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn spd_rate(rate: f32) -> i32 {
+    let rate = if rate.is_finite() { rate.clamp(MIN_RATE, MAX_RATE) } else { 1.0 };
+    let scaled = if rate >= 1.0 { (rate - 1.0) / (MAX_RATE - 1.0) * 100.0 } else { (rate - 1.0) * 100.0 };
+    scaled.round().clamp(-100.0, 100.0) as i32
+}
+
+/// The arguments of `spd-say`: wait until the sentence has been spoken (`-w`), read it from stdin
+/// (`-e`), the speed, and the language whenever the sentence has one. Speech Dispatcher's default
+/// language follows its own settings (often the system locale), so English is named too.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn spd_args(rate: f32, lang: Option<&str>) -> Vec<String> {
+    let mut a = vec!["-w".to_string(), "-e".to_string(), "-r".to_string(), spd_rate(rate).to_string()];
+    if let Some(p) = lang.and_then(primary_tag) {
+        a.push("-l".into());
+        a.push(p);
+    }
+    a
 }
 
 /// Should `speak` say the sentence again with the default voice? When it gave the program a voice
@@ -883,21 +917,32 @@ fn speak_with(text: &str, lang: Option<&str>, rate: f32, changed: &dyn Fn() -> b
             c.args(args);
             tries.push((c, voiced));
         }
+        // Speech Dispatcher, which many desktops install without the espeak command.
+        let args = spd_args(rate, lang);
+        let voiced = args.iter().any(|a| a == "-l");
+        let mut c = Command::new(SPD_SAY);
+        c.args(args);
+        tries.push((c, voiced));
     }
     let _ = (&wpm, lang);
     let mut child = None;
+    let mut not_found = true;
     let mut last_err = String::from("no speech program on this system");
     for (mut c, voiced) in tries {
         match c.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             Ok(ch) => {
-                child = Some((ch, voiced));
+                child = Some((ch, voiced, c.get_program() == SPD_SAY));
                 break;
             }
-            Err(e) => last_err = e.to_string(),
+            Err(e) => {
+                not_found &= e.kind() == std::io::ErrorKind::NotFound;
+                last_err = e.to_string();
+            }
         }
     }
-    let Some((mut child, voiced)) = child else {
-        return (Spoken::Failed(format!("Read Aloud couldn't start the speech program: {last_err}")), false, None);
+    let Some((mut child, voiced, dispatcher)) = child else {
+        let message = if not_found { MISSING_PROGRAM.to_string() } else { format!("Read Aloud couldn't start the speech program: {last_err}") };
+        return (Spoken::Failed(message), false, None);
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(text.as_bytes());
@@ -912,6 +957,10 @@ fn speak_with(text: &str, lang: Option<&str>, rate: f32, changed: &dyn Fn() -> b
         if changed() {
             let _ = child.kill();
             let _ = child.wait();
+            // Speech Dispatcher keeps speaking a message after the client that sent it is gone.
+            if dispatcher {
+                let _ = Command::new(SPD_SAY).arg("-C").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
             return (Spoken::Interrupted, voiced, None);
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
