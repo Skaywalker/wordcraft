@@ -195,7 +195,11 @@ pub fn decode(aff: &[u8], dic: &[u8]) -> Result<(String, String), String> {
     let directive = |name: &str| {
         head.lines().find_map(|l| {
             let l = l.trim_start_matches('\u{feff}');
-            l.strip_prefix(name).filter(|rest| rest.starts_with([' ', '\t'])).map(|rest| rest.trim().to_ascii_uppercase())
+            // Only the first argument counts, as in Hunspell: `FLAG UTF-8 # Unicode flags` is UTF-8.
+            l.strip_prefix(name)
+                .filter(|rest| rest.starts_with([' ', '\t']))
+                .and_then(|rest| rest.split([' ', '\t']).find(|f| !f.is_empty()))
+                .map(str::to_ascii_uppercase)
         })
     };
     let set = directive("SET").unwrap_or_else(|| "UTF-8".into());
@@ -331,9 +335,12 @@ fn decode_utf8_aff(aff: &[u8]) -> Result<String, String> {
             let in_comment = comment_at.is_some_and(|c| words.get(c).is_some_and(|&w| i >= w));
             let decoded = match (dir.as_str(), field) {
                 _ if in_comment => String::from_utf8_lossy(p).into_owned(),
-                ("AF" | "PFX" | "SFX" | "COMPOUNDRULE", Some(1)) => bytes_as_flags(p),
+                ("AF" | "COMPOUNDRULE" | "SYLLABLENUM", Some(1)) => bytes_as_flags(p),
                 ("PFX" | "SFX", Some(3)) | ("CHECKCOMPOUNDPATTERN", Some(1 | 2)) => text_and_flags(p, &what)?,
-                (d, Some(1)) if FLAG_DIRECTIVES.contains(&d) => bytes_as_flags(p),
+                // A field that names one flag keeps its first byte, as Hunspell's `decode_flag`
+                // does: `SFX é` is the flag 0xC3, the first of the two flags `kert/é` carries.
+                ("PFX" | "SFX", Some(1)) => bytes_as_flags(p.get(..1).unwrap_or_default()),
+                (d, Some(1)) if FLAG_DIRECTIVES.contains(&d) => bytes_as_flags(p.get(..1).unwrap_or_default()),
                 _ => std::str::from_utf8(p).map_err(|e| format!("{what}: not UTF-8: {e}"))?.to_string(),
             };
             out.push_str(&decoded);
@@ -463,6 +470,28 @@ mod tests {
         assert_eq!(d, "kert/\u{e9}\n");
         assert!(decode(b"SET UTF-8\nSFX a Y 1\nSFX a 0 \xe9 .\n", b"").is_err(), "an affix must be UTF-8");
         assert!(decode(b"SET UTF-8\n", b"1\nh\xe1z/a\n").is_err(), "a stem must be UTF-8");
+    }
+
+    #[test]
+    fn single_flag_fields_keep_their_first_byte() {
+        // Without `FLAG UTF-8`, a UTF-8 `é` (0xC3 0xA9) in a field that names one flag is the
+        // flag 0xC3; in a `.dic` flag list it is the two flags 0xC3 and 0xA9.
+        let aff = "SET UTF-8\nKEEPCASE é\nSFX é Y 1\nSFX é 0 ok .\nSYLLABLENUM é\n".as_bytes();
+        let (a, d) = decode(aff, "2\nkert/é\nNATO/é\n".as_bytes()).unwrap();
+        assert!(a.contains("KEEPCASE \u{c3}\n") && a.contains("SFX \u{c3} Y 1") && a.contains("SFX \u{c3} 0 ok ."), "{a}");
+        assert!(a.contains("SYLLABLENUM \u{c3}\u{a9}"), "SYLLABLENUM lists flags: {a}");
+        assert!(d.contains("kert/\u{c3}\u{a9}"));
+        let dict = crate::affix::AffixDict::from_hunspell(&a, &d, &[]).unwrap();
+        assert!(dict.check("kert") && dict.check("kertok"));
+        assert!(dict.check("NATO") && !dict.check("Nato"), "KEEPCASE é reaches NATO/é");
+    }
+
+    #[test]
+    fn a_comment_after_flag_utf8_keeps_unicode_flags() {
+        let (_, d) = decode(b"SET UTF-8\nFLAG UTF-8 # Unicode flags\n", "kert/\u{e9}\n".as_bytes()).unwrap();
+        assert_eq!(d, "kert/\u{e9}\n");
+        let (_, d) = decode(b"SET\tUTF-8  # comment\nFLAG\t\tUTF-8\n", "kert/\u{e9}\n".as_bytes()).unwrap();
+        assert_eq!(d, "kert/\u{e9}\n", "repeated spaces and tabs separate the argument");
     }
 
     #[test]
