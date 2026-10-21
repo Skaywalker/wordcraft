@@ -20,20 +20,24 @@
 //!   as `falevél`).
 //! - **Boundaries.** `CHECKCOMPOUNDDUP` (no part twice in a row), `CHECKCOMPOUNDTRIPLE` (no
 //!   letter three times across a boundary: `sakkkör`), `CHECKCOMPOUNDCASE` (no capital at a
-//!   boundary), `CHECKCOMPOUNDPATTERN` (no part ending in one string followed by one starting
-//!   with another) and `CHECKCOMPOUNDREP` (no compound, and no two neighbouring parts, that is a
+//!   boundary), `CHECKCOMPOUNDPATTERN` (no part ending in one string, or with `0` a stem as
+//!   listed, followed by one starting with another; a simplified spelling the pattern may name
+//!   isn't accepted) and `CHECKCOMPOUNDREP` (no compound, and no two neighbouring parts, that is a
 //!   `REP` misspelling of a word: `hajlak` for `haljak`). Two neighbouring parts that together
 //!   are a listed word are read as that word (`szezon` + `légzáró`, never `lég` + `záró`).
 //! - **`COMPOUNDRULE`**: patterns of flags with `*` and `?` (`0*1`: numbers such as
 //!   `1999-ben`), matched by stems, the last of which may carry suffixes.
-//! - **`BREAK`**: strings at which a word is split and both sides checked (`Petőfi-vers`); `^`
-//!   and `$` anchor one to the start or the end (`-féle$`). Only dictionaries that declare
+//! - **`BREAK`**: strings at which a word is split and both sides checked like words, each in its
+//!   own letter case (`Petőfi-vers`, `alma-Fa`; a word in capitals is split capitalized); `^`
+//!   and `$` anchor one to the start or the end (`-féle$`). A word with ten break points or more
+//!   is wrong, as in Hunspell. Only dictionaries that declare
 //!   `BREAK` get breaks; Hunspell's built-in default (break at hyphens) isn't applied, so the
 //!   languages that check hyphenated words themselves keep doing so.
 //!
 //! `NEEDAFFIX` stems are words only with an affix; it is read here with the other flags of this
-//! family. Searches are bounded: at most [`MAX_PARTS`] parts and [`PART_BUDGET`] part lookups
-//! per word, and [`BREAK_BUDGET`] checks for the breaks of one word.
+//! family. Searches are bounded: at most [`MAX_PARTS`] parts and [`PART_BUDGET`] part and `REP`
+//! lookups per word (a state that failed once isn't searched again), and [`BREAK_BUDGET`] checks
+//! for the breaks of one word, each side checked once.
 
 use super::{AffixDict, Mask, Parse, Rule};
 
@@ -59,6 +63,7 @@ pub(super) const DIRECTIVES: &[&str] = &[
     "COMPOUNDRULE",
     "COMPOUNDSYLLABLE",
     "COMPOUNDWORDMAX",
+    "LANG",
     "NEEDAFFIX",
     "ONLYINCOMPOUND",
     "PSEUDOROOT",
@@ -74,6 +79,21 @@ pub(super) const MAX_PARTS: usize = 12;
 pub(super) const PART_BUDGET: u32 = 6000;
 /// Most checks spent on the break points of one word.
 pub(super) const BREAK_BUDGET: u32 = 64;
+/// A word with this many break points or more is wrong, as in Hunspell (`fa-fa-…` with ten
+/// hyphens).
+const MAX_BREAK_POINTS: usize = 10;
+
+/// The break checks of one word: the budget left and the sides already checked.
+pub(super) struct Breaks {
+    budget: u32,
+    pub(super) seen: crate::patterns::FxMap<String, bool>,
+}
+
+impl Breaks {
+    pub(super) fn new() -> Breaks {
+        Breaks { budget: BREAK_BUDGET, seen: crate::patterns::FxMap::default() }
+    }
+}
 
 /// Private-use flags the reader adds to an inflected form listed as a stem: one, two or three
 /// syllables more than its lemma (`st:` in its morphology), which the 6–3 rule doesn't count.
@@ -84,6 +104,11 @@ pub(super) fn lemma_flag(extra: usize) -> Option<char> {
     LEMMA_FLAGS.get(extra.checked_sub(1)?.min(LEMMA_FLAGS.len() - 1)).copied()
 }
 
+/// The syllables of `s`: its letters, in lower case, that are among `vowels`.
+pub(super) fn count_syllables(vowels: &[char], s: &str) -> usize {
+    s.chars().filter(|ch| vowels.contains(&ch.to_lowercase().next().unwrap_or(*ch))).count()
+}
+
 /// The vowels of `COMPOUNDSYLLABLE`, when the dictionary counts syllables.
 pub(super) fn syllable_vowels(lines: &[String]) -> Option<Vec<char>> {
     lines.iter().find_map(|l| {
@@ -92,7 +117,8 @@ pub(super) fn syllable_vowels(lines: &[String]) -> Option<Vec<char>> {
     })
 }
 
-/// Skips the count line of each table directive (the first line with one number).
+/// Skips the count line of each table directive: its first line, when that is a number (a
+/// trailing comment may follow, as in Hunspell: `BREAK 3 # breaks`).
 #[derive(Default)]
 pub(super) struct TableHeaders {
     seen: [bool; TABLES.len()],
@@ -105,7 +131,6 @@ impl TableHeaders {
         if let Some(i) = TABLES.iter().position(|&t| t == dir)
             && let Some(seen) = self.seen.get_mut(i)
             && !*seen
-            && fields.len() == 2
             && fields.get(1).is_some_and(|n| n.parse::<usize>().is_ok())
         {
             *seen = true;
@@ -138,7 +163,8 @@ enum Repeat {
 }
 
 /// A `CHECKCOMPOUNDPATTERN`: no part ending in `end` (with `end_flag`, if any) before one
-/// starting with `begin` (with `begin_flag`).
+/// starting with `begin` (with `begin_flag`). An `end` of `0` stands for a part that is a stem
+/// as listed, without affixes.
 #[derive(Clone, Debug)]
 struct Pattern {
     end: String,
@@ -175,6 +201,8 @@ pub(super) struct Compounding {
     patterns: Vec<Pattern>,
     rules: Vec<Vec<(Mask, Repeat)>>,
     breaks: Vec<String>,
+    /// `LANG hu_HU`: the dictionary is Hungarian (see [`AffixDict::part_ok`]).
+    hungarian: bool,
 }
 
 impl Default for Compounding {
@@ -203,6 +231,7 @@ impl Default for Compounding {
             patterns: Vec::new(),
             rules: Vec::new(),
             breaks: Vec::new(),
+            hungarian: false,
         }
     }
 }
@@ -273,17 +302,17 @@ impl Compounding {
                 "CHECKCOMPOUNDREP" => c.check_rep = true,
                 "CHECKCOMPOUNDCASE" => c.check_case = true,
                 "CHECKCOMPOUNDTRIPLE" => c.check_triple = true,
-                // A third field is a simplified spelling the compound may take instead; those
-                // patterns aren't applied.
-                "CHECKCOMPOUNDPATTERN" if f.len() == 3 => {
+                // A third field, a simplified spelling the compound may take instead, isn't
+                // applied: the spelling the pattern forbids stays wrong, as in Hunspell. Fields
+                // after it (a comment) don't count.
+                "CHECKCOMPOUNDPATTERN" if f.len() >= 3 => {
                     let (end, end_flag) = split_flag(at(1), bit_of);
                     let (begin, begin_flag) = split_flag(at(2), bit_of);
-                    if end != "0" {
-                        c.patterns.push(Pattern { end, end_flag, begin, begin_flag });
-                    }
+                    c.patterns.push(Pattern { end, end_flag, begin, begin_flag });
                 }
                 "COMPOUNDRULE" => c.rules.push(parse_rule(at(1), bit_of)?),
                 "BREAK" if !at(1).is_empty() => c.breaks.push(at(1).to_string()),
+                "LANG" => c.hungarian = at(1) == "hu" || at(1).starts_with("hu_") || at(1).starts_with("hu-"),
                 _ => {}
             }
         }
@@ -314,12 +343,16 @@ struct Part {
     uncounted: usize,
 }
 
-/// One compound search: the word, its char boundaries, and the parts looked up so far.
+/// One compound search: the word, its char boundaries, the parts looked up so far and the
+/// states that led nowhere.
 struct Search<'w> {
     w: &'w str,
     /// Byte offsets of the char boundaries, `0` and `w.len()` included.
     bounds: Vec<usize>,
-    parts: std::collections::HashMap<(usize, usize, Place), Option<Part>>,
+    parts: crate::patterns::FxMap<(usize, usize, Place), Option<Part>>,
+    /// `(start, start of the previous part, words so far)` of each [`AffixDict::compound_from`]
+    /// call that failed: the rest of the word can't be found from there again.
+    failed: crate::patterns::FxMap<(usize, usize, usize), ()>,
     budget: u32,
     deny: Mask,
 }
@@ -335,18 +368,32 @@ impl AffixDict {
         if bounds.len() < 3 {
             return false;
         }
-        let mut s = Search { w, bounds, parts: std::collections::HashMap::new(), budget: PART_BUDGET, deny };
+        let mut s = Search { w, bounds, parts: Default::default(), failed: Default::default(), budget: PART_BUDGET, deny };
         (c.enabled() && self.compound_from(&mut s, 0, 0, None)) || c.rules.iter().any(|r| self.rule_from(&mut s, r, 0, 0, 0))
     }
 
     /// Can `s.w` from boundary `start` on be the rest of a compound that has `words` words so
     /// far, the last of them `prev` (byte range and part)?
     fn compound_from(&self, s: &mut Search<'_>, start: usize, words: usize, prev: Option<(usize, usize, Part)>) -> bool {
-        let c = &self.compound;
-        let last_bound = s.bounds.len() - 1;
         if words >= MAX_PARTS {
             return false;
         }
+        // The previous part ends at `start`, so its start and `words` decide what may follow.
+        let state = (start, prev.map_or(usize::MAX, |(a, _, _)| a), words);
+        if s.failed.contains_key(&state) {
+            return false;
+        }
+        let found = self.compound_rest(s, start, words, prev);
+        if !found {
+            s.failed.insert(state, ());
+        }
+        found
+    }
+
+    /// [`AffixDict::compound_from`] without the record of failed states.
+    fn compound_rest(&self, s: &mut Search<'_>, start: usize, words: usize, prev: Option<(usize, usize, Part)>) -> bool {
+        let c = &self.compound;
+        let last_bound = s.bounds.len() - 1;
         for end in (start + c.min)..=last_bound {
             if s.budget == 0 {
                 return false;
@@ -371,13 +418,13 @@ impl AffixDict {
             s.budget = s.budget.saturating_sub(1);
             let Some(part) = self.part(s, a, b, place) else { continue };
             if let Some((pa, pb, prev_part)) = prev
-                && !self.boundary_ok(s.w, (pa, pb, prev_part), (a, b, part))
+                && !self.boundary_ok(s.w, (pa, pb, prev_part), (a, b, part), &mut s.budget)
             {
                 continue;
             }
             let total = words + part.words;
             if is_last {
-                if self.compound_done(s.w, total, part) {
+                if self.compound_done(s.w, total, part, &mut s.budget) {
                     return true;
                 }
             } else if self.compound_from(s, end, total, Some((a, b, part))) {
@@ -437,11 +484,14 @@ impl AffixDict {
             return false;
         }
         // Inside a compound an affix needs `COMPOUNDPERMITFLAG`, unless it carries the compound
-        // flag itself (`kedvez` + `ő` → `kedvezőpocak`). A prefix after the first part needs the
-        // compound flag: the Hungarian dictionary puts the permit flag on its verb prefixes, yet
-        // Hunspell rejects a verb with a prefix after a noun (`előanyag` + `elszánt`).
+        // flag itself (`kedvez` + `ő` → `kedvezőpocak`). In a Hungarian dictionary a prefix after
+        // the first part needs the compound flag too. This isn't Hunspell's own rule (a small
+        // dictionary with a permitted prefix compounds after a noun, with `LANG hu_HU` or
+        // without), but it reads the Hungarian dictionary closer to Hunspell than the permit flag
+        // does: that one puts the permit flag on its verb prefixes, yet Hunspell rejects
+        // `előanyag` + `elszánt` (and accepts `kozmodróm` + `kiélezett`, which this misses).
         let inside = c.permit | c.flag | at_place;
-        if place != Place::First && p.prefix.is_some_and(|r| !r.cont.meets(c.flag | at_place)) {
+        if c.hungarian && place != Place::First && p.prefix.is_some_and(|r| !r.cont.meets(c.flag | at_place)) {
             return false;
         }
         !(place != Place::Last && p.suffix_rules().any(|r: &Rule| !r.cont.meets(inside)))
@@ -459,11 +509,11 @@ impl AffixDict {
     }
 
     fn syllables(&self, s: &str) -> usize {
-        s.chars().filter(|ch| self.compound.vowels.contains(&ch.to_lowercase().next().unwrap_or(*ch))).count()
+        count_syllables(&self.compound.vowels, s)
     }
 
-    /// May part `(c, d)` follow part `(a, b)`?
-    fn boundary_ok(&self, w: &str, (a, b, prev): (usize, usize, Part), (c, d, next): (usize, usize, Part)) -> bool {
+    /// May part `(c, d)` follow part `(a, b)`? `CHECKCOMPOUNDREP` spends `budget`.
+    fn boundary_ok(&self, w: &str, (a, b, prev): (usize, usize, Part), (c, d, next): (usize, usize, Part), budget: &mut u32) -> bool {
         let cfg = &self.compound;
         let (Some(left), Some(right)) = (w.get(a..b), w.get(c..d)) else { return false };
         if cfg.check_dup && left == right {
@@ -475,7 +525,7 @@ impl AffixDict {
         if self.stem_mask(&joined).is_some() {
             return false;
         }
-        if cfg.check_rep && self.rep_misspelling(&joined) {
+        if cfg.check_rep && self.rep_misspelling(&joined, budget) {
             return false;
         }
         let mut l = left.chars().rev();
@@ -493,15 +543,17 @@ impl AffixDict {
             return false;
         }
         !cfg.patterns.iter().any(|p| {
-            left.ends_with(p.end.as_str())
-                && right.starts_with(p.begin.as_str())
-                && (p.end_flag.is_empty() || prev.stem.meets(p.end_flag))
-                && (p.begin_flag.is_empty() || next.stem.meets(p.begin_flag))
+            let end = if p.end == "0" {
+                self.stem_mask(left).is_some_and(|m| p.end_flag.is_empty() || m.meets(p.end_flag))
+            } else {
+                left.ends_with(p.end.as_str()) && (p.end_flag.is_empty() || prev.stem.meets(p.end_flag))
+            };
+            end && right.starts_with(p.begin.as_str()) && (p.begin_flag.is_empty() || next.stem.meets(p.begin_flag))
         })
     }
 
     /// The checks on a whole compound of `words` words whose last part is `last`.
-    fn compound_done(&self, w: &str, words: usize, last: Part) -> bool {
+    fn compound_done(&self, w: &str, words: usize, last: Part, budget: &mut u32) -> bool {
         let c = &self.compound;
         if let Some(max) = c.word_max
             && words > max
@@ -511,12 +563,13 @@ impl AffixDict {
                 return false;
             }
         }
-        !(c.check_rep && self.rep_misspelling(w))
+        !(c.check_rep && self.rep_misspelling(w, budget))
     }
 
     /// Is `w` a `REP` misspelling of a word: does one replacement turn it into a word without
-    /// compounding? `^` and `$` tie a pattern to the start or the end.
-    fn rep_misspelling(&self, w: &str) -> bool {
+    /// compounding? `^` and `$` tie a pattern to the start or the end. Each word looked up costs
+    /// one unit of `budget`; with none left, `w` counts as a misspelling.
+    fn rep_misspelling(&self, w: &str, budget: &mut u32) -> bool {
         for (from, to) in &self.rep {
             let (anchored_start, from) = match from.strip_prefix('^') {
                 Some(f) => (true, f),
@@ -534,6 +587,10 @@ impl AffixDict {
                     continue;
                 }
                 let (Some(head), Some(tail)) = (w.get(..i), w.get(i + from.len()..)) else { continue };
+                if *budget == 0 {
+                    return true;
+                }
+                *budget -= 1;
                 if self.simple(&format!("{head}{to}{tail}"), Mask::EMPTY) {
                     return true;
                 }
@@ -579,15 +636,21 @@ impl AffixDict {
 
     /// Is `w` correct when split at a `BREAK` point, both sides checked (each side may break
     /// again)? `^x` and `x$` take `x` off the start or the end.
-    pub(super) fn check_breaks(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
-        for b in &self.compound.breaks {
-            if *budget == 0 {
+    pub(super) fn check_breaks(&self, w: &str, deny: Mask, st: &mut Breaks) -> bool {
+        let breaks = &self.compound.breaks;
+        let anchored = |b: &str| b.starts_with('^') || b.ends_with('$');
+        let points: usize = breaks.iter().filter(|b| !b.is_empty() && !anchored(b)).map(|b| w.matches(b.as_str()).count()).sum();
+        if points >= MAX_BREAK_POINTS {
+            return false;
+        }
+        for b in breaks {
+            if st.budget == 0 {
                 return false;
             }
             if let Some(x) = b.strip_prefix('^').filter(|x| !x.is_empty()) {
                 if let Some(rest) = w.strip_prefix(x).filter(|r| !r.is_empty()) {
-                    *budget -= 1;
-                    if self.side_ok(rest, deny, budget) {
+                    st.budget -= 1;
+                    if self.side_ok(rest, deny, st) {
                         return true;
                     }
                 }
@@ -595,8 +658,8 @@ impl AffixDict {
             }
             if let Some(x) = b.strip_suffix('$').filter(|x| !x.is_empty()) {
                 if let Some(rest) = w.strip_suffix(x).filter(|r| !r.is_empty()) {
-                    *budget -= 1;
-                    if self.side_ok(rest, deny, budget) {
+                    st.budget -= 1;
+                    if self.side_ok(rest, deny, st) {
                         return true;
                     }
                 }
@@ -604,11 +667,11 @@ impl AffixDict {
             }
             for (i, _) in w.match_indices(b.as_str()) {
                 let (Some(left), Some(right)) = (w.get(..i), w.get(i + b.len()..)) else { continue };
-                if left.is_empty() || right.is_empty() || *budget == 0 {
+                if left.is_empty() || right.is_empty() || st.budget == 0 {
                     continue;
                 }
-                *budget -= 1;
-                if self.side_ok(left, deny, budget) && self.side_ok(right, deny, budget) {
+                st.budget -= 1;
+                if self.side_ok(left, deny, st) && self.side_ok(right, deny, st) {
                     return true;
                 }
             }
@@ -814,6 +877,31 @@ ipso facto\t1
     }
 
     #[test]
+    fn break_sides_are_checked_like_words() {
+        // As Hunspell 1.7 does with the Hungarian dictionary: each side of a break has its own
+        // case readings (`alma-Fa`, `Petőfi-HÁZ`), and a word in capitals is split capitalized,
+        // so `SÁMBOKI-HAZAY` is `Sámboki-hazay`, which is wrong.
+        let d = AffixDict::from_hunspell(AFF, &format!("{DIC}Sámboki/Y\nHazay/Y\n"), &[]).unwrap();
+        assert_words(
+            &d,
+            &["alma-Fa", "Alma-Fa", "ALMA-fa", "alma-FA", "Petőfi-Ház", "Petőfi-HÁZ", "alma-fa-Ház", "Sámboki-Hazay", "SÁMBOKI-Hazay"],
+            &["aLMA-fa", "Petőfi-HáZ", "petőfi-ház", "SÁMBOKI-HAZAY", "Sámboki-hazay"],
+        );
+    }
+
+    #[test]
+    fn long_hyphenated_headings_are_checked_within_the_budget() {
+        // Every side is checked once per word, so a heading in capitals with many parts is
+        // still found correct; ten break points or more make a word wrong, as in Hunspell.
+        let d = dict();
+        let parts = ["alma", "fa", "ház", "tető", "kulcs", "szék", "alma", "fa", "ház", "tető", "kulcs"];
+        assert!(d.check(&parts[..6].join("-").to_uppercase()));
+        assert!(d.check(&parts[..10].join("-")) && d.check(&parts[..10].join("-").to_uppercase()), "nine break points");
+        assert!(!d.check(&parts.join("-")), "ten break points");
+        assert!(!d.check(&format!("{}-xyz", parts[..6].join("-").to_uppercase())));
+    }
+
+    #[test]
     fn dictionary_phrases_are_not_words() {
         let d = dict();
         assert!(!d.check("ipso") && !d.check("facto"));
@@ -870,6 +958,93 @@ ipso facto\t1
         let t = std::time::Instant::now();
         assert!(!d.check(&w));
         assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn failed_states_are_searched_once() {
+        // With `COMPOUNDMIN 1` the search meets the same dead ends again and again; once a state
+        // has failed it costs nothing more, so the budget lasts until the one valid split, which
+        // Hunspell accepts.
+        let d = AffixDict::from_hunspell("SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 1\n", "3\naaa/Y\naaaa/Y\naab/Y\n", &[]).unwrap();
+        for n in [40, 42, 44] {
+            assert!(d.check(&format!("{}aab", "a".repeat(n))), "{n}");
+        }
+        assert!(!d.check(&format!("{}aab", "a".repeat(45))), "45 = 3 × 15 needs more than twelve parts");
+    }
+
+    #[test]
+    fn compound_patterns_as_hunspell_reads_them() {
+        // Checked with the Hunspell 1.7 command line: a replacement field and a trailing comment
+        // leave the pattern in force, a commented count line is a count, and `0` stands for a
+        // part that is a stem as listed.
+        let dic = "4\nrossz/Y\nszék/Y\nház/Y\nkis/Y\n";
+        let aff =
+            |pattern: &str| format!("SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 2\nCHECKCOMPOUNDPATTERN 1 # count\nCHECKCOMPOUNDPATTERN {pattern}\n");
+        for pattern in ["ssz sz", "ssz sz sz", "ssz sz # comment", "ssz sz # comment more"] {
+            let d = AffixDict::from_hunspell(&aff(pattern), dic, &[]).unwrap();
+            assert_words(&d, &["kisszék", "rosszház", "székrossz"], &["rosszszék"]);
+        }
+        let d = AffixDict::from_hunspell(&aff("0 sz"), dic, &[]).unwrap();
+        assert_words(&d, &["rosszház", "székrossz"], &["rosszszék", "kisszék", "házszék"]);
+        let d = AffixDict::from_hunspell(&aff("0/Y sz"), dic, &[]).unwrap();
+        assert_words(&d, &["rosszház"], &["kisszék"]);
+        let back = AffixDict::from_bytes(&d.to_bytes()).unwrap();
+        assert_words(&back, &["rosszház"], &["kisszék"]);
+    }
+
+    #[test]
+    fn a_commented_count_line_is_no_break() {
+        let aff = "SET UTF-8\nBREAK 1 # breaks\nBREAK -\n";
+        let d = AffixDict::from_hunspell(aff, "2\nalma\nfa\n", &[]).unwrap();
+        assert_words(&d, &["alma-fa"], &["alma1fa", "alma#fa"]);
+    }
+
+    #[test]
+    fn a_later_prefix_needs_the_compound_flag_only_in_hungarian() {
+        // Hunspell compounds `anyag` + `el` `szánt` when the prefix has the permit flag, with
+        // `LANG hu_HU` or without; the Hungarian reading here asks for the compound flag, which
+        // matches the Hungarian dictionary closer (see `part_ok`), and only for it.
+        let aff = "SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDPERMITFLAG P\nCOMPOUNDMIN 2\nPFX e Y 1\nPFX e 0 el/P .\nPFX f Y 1\nPFX f 0 fel/PY .\n";
+        let dic = "2\nanyag/Ye\nszánt/Yef\n";
+        let plain = AffixDict::from_hunspell(aff, dic, &[]).unwrap();
+        assert_words(&plain, &["elszánt", "anyagelszánt", "anyagfelszánt", "elanyagszánt"], &[]);
+        let hu = AffixDict::from_hunspell(&format!("LANG hu_HU\n{aff}"), dic, &[]).unwrap();
+        assert_words(&hu, &["elszánt", "anyagfelszánt", "elanyagszánt"], &["anyagelszánt"]);
+        assert!(!AffixDict::from_bytes(&hu.to_bytes()).unwrap().check("anyagelszánt"), "the compact format keeps the language");
+    }
+
+    #[test]
+    fn compound_rep_checks_spend_the_budget() {
+        // Every REP replacement looked up costs budget, so many REP hits at every boundary end
+        // quickly.
+        let mut aff = String::from("SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 1\nCHECKCOMPOUNDREP\nREP 200\n");
+        for i in 0..200 {
+            aff.push_str(&format!("REP a {}\n", "b".repeat(i % 7 + 1)));
+        }
+        let d = AffixDict::from_hunspell(&aff, "2\na/Y\naa/Y\n", &[]).unwrap();
+        let t = std::time::Instant::now();
+        let _ = d.check(&format!("{}x", "a".repeat(60)));
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn forms_leave_out_what_is_no_word() {
+        // A bare `NEEDAFFIX` stem and every form of an `ONLYINCOMPOUND` stem aren't words.
+        let d = dict();
+        assert!(d.forms("mikro").is_empty());
+        let forms = d.forms("üzelm");
+        assert!(!forms.iter().any(|f| f == "üzelm") && forms.iter().any(|f| f == "üzelmok"), "{forms:?}");
+        for f in forms {
+            assert!(d.check(&f), "{f}");
+        }
+    }
+
+    #[test]
+    fn numbered_morphology_aliases_may_carry_a_comment() {
+        // `AM 1 # morphology` is the count line; alias 1 is the first entry after it.
+        let aff = format!("{AFF}AM 1 # morphology\nAM st:levél ts:PLUR\n");
+        let d = AffixDict::from_hunspell(&aff, "4\ntető/Y\nfa/Y\nkulcs/Y\nlevelek/Y\t1\n", &[]).unwrap();
+        assert!(d.check("tetőfakulcslevelek"), "6 of 7 syllables count");
     }
 
     proptest::proptest! {

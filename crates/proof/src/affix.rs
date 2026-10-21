@@ -20,8 +20,9 @@
 //! and `REP`.
 //! Morphological data (`AM` aliases, the fields after a stem) is skipped. Stems marked
 //! `NEEDAFFIX` are words only with an affix, and compound words and word breaks follow
-//! [`compound`]. Rejected: long or numeric flags, `CIRCUMFIX`, `FULLSTRIP`, `COMPLEXPREFIXES`
-//! and `CHECKSHARPS`, which change which words are correct in ways this engine doesn't implement.
+//! [`compound`]. Rejected: long or numeric flags, `CIRCUMFIX`, `FULLSTRIP`, `COMPLEXPREFIXES`,
+//! `CHECKSHARPS`, `FORCEUCASE` and `SIMPLIFIEDTRIPLE`, which change which words are correct in
+//! ways this engine doesn't implement.
 //!
 //! Lookups never panic: stems sit in one string, found through an open-addressing hash table, and
 //! a probe allocates only small scratch strings for the candidate roots it tries.
@@ -42,7 +43,9 @@ pub const MAX_WORD_BYTES: usize = 120;
 const EMPTY: u32 = u32::MAX;
 
 /// Directives that change which words are correct in ways this engine doesn't implement.
-const UNSUPPORTED: &[&str] = &["CHECKSHARPS", "CIRCUMFIX", "COMPLEXPREFIXES", "FULLSTRIP", "OCONV"];
+/// `FORCEUCASE` (a compound must be capitalized) and `SIMPLIFIEDTRIPLE` (`sakk` + `kör` written
+/// `sakkör`) change which compounds are correct.
+const UNSUPPORTED: &[&str] = &["CHECKSHARPS", "CIRCUMFIX", "COMPLEXPREFIXES", "FORCEUCASE", "FULLSTRIP", "OCONV", "SIMPLIFIEDTRIPLE"];
 
 /// Most distinct flags a dictionary may use: every single-byte flag (the Hungarian dictionary
 /// uses 158).
@@ -280,6 +283,10 @@ pub struct AffixDict {
     sfx_by_flag: Vec<Vec<u32>>,
     /// Longest appended suffix, in chars.
     max_sfx_chars: usize,
+    /// Appended string → prefix rules.
+    pfx_index: FxMap<Box<str>, Vec<u32>>,
+    /// Longest appended prefix, in chars.
+    max_pfx_chars: usize,
     try_chars: String,
     key: String,
     map: Vec<Vec<char>>,
@@ -338,6 +345,15 @@ pub fn casing(w: &str) -> Casing {
         Casing::Upper
     } else {
         Casing::Mixed
+    }
+}
+
+/// The text a word is split at its `BREAK` points in: capitalized for a word in capitals (as
+/// Hunspell does), as written otherwise.
+fn break_text(w: &str) -> std::borrow::Cow<'_, str> {
+    match casing(w) {
+        Casing::Upper => std::borrow::Cow::Owned(capitalize(&w.to_lowercase())),
+        _ => std::borrow::Cow::Borrowed(w),
     }
 }
 
@@ -476,21 +492,21 @@ fn parse_aff(aff: &str) -> Result<Rules, String> {
         }
         let at = |k: usize| f.get(k).copied().unwrap_or("");
         match dir {
-            "SET" | "LANG" | "NAME" | "VERSION" | "HOME" | "WORDCHARS" | "MAXNGRAMSUGS" | "MAXDIFF" | "ONLYMAXDIFF" | "NOSPLITSUGS"
-            | "SUGSWITHDOTS" | "WARN" | "FORBIDWARN" | "MAXCPDSUGS" => {}
+            "SET" | "NAME" | "VERSION" | "HOME" | "WORDCHARS" | "MAXNGRAMSUGS" | "MAXDIFF" | "ONLYMAXDIFF" | "NOSPLITSUGS" | "SUGSWITHDOTS"
+            | "WARN" | "FORBIDWARN" | "MAXCPDSUGS" => {}
             // Morphological aliases are kept for the morphology readers; a flag that only
             // matters for morphological generation leaves the words it marks correct.
             "LEMMA_PRESENT" => {}
             "SUBSTANDARD" => r.substandard = Some(one_flag(at(1), dir, n)?),
             "AM" => {
-                if !am_header && f.len() == 2 && at(1).parse::<usize>().is_ok() {
+                if !am_header && at(1).parse::<usize>().is_ok() {
                     am_header = true;
                 } else {
                     r.morph_aliases.push(f.get(1..).unwrap_or_default().join(" "));
                 }
             }
-            // The first `AF` or `ICONV` line is the table's count, as in Hunspell, even with a
-            // trailing comment (`AF 1559 # aliases`).
+            // The first `AM`, `AF` or `ICONV` line is the table's count, as in Hunspell, even with
+            // a trailing comment (`AF 1559 # aliases`).
             "AF" => {
                 if !af_header {
                     af_header = true;
@@ -643,7 +659,7 @@ impl AffixDict {
                 if let Some(lemma) = split_fields(morph).find_map(|f| f.strip_prefix("st:"))
                     && !split_fields(morph).any(|f| f.starts_with("ds:"))
                 {
-                    let count = |s: &str| s.chars().filter(|c| v.contains(c)).count();
+                    let count = |s: &str| compound::count_syllables(v, s);
                     flags.extend(compound::lemma_flag(count(&word).saturating_sub(count(lemma))));
                 }
             }
@@ -752,6 +768,13 @@ impl AffixDict {
         self.sfx_by_flag = by_flag;
         self.max_sfx_chars = self.suffixes.iter().map(|r| r.add.chars().count()).max().unwrap_or(0);
         self.sfx_index = idx;
+        let mut pfx: FxMap<Box<str>, Vec<u32>> = FxMap::default();
+        for (i, r) in self.prefixes.iter().enumerate() {
+            let Ok(i) = u32::try_from(i) else { break };
+            pfx.entry(r.add.clone()).or_default().push(i);
+        }
+        self.max_pfx_chars = self.prefixes.iter().map(|r| r.add.chars().count()).max().unwrap_or(0);
+        self.pfx_index = pfx;
         let n = self.len();
         let size = (n.max(1) * 2).next_power_of_two();
         let mut table = vec![EMPTY; size];
@@ -870,8 +893,10 @@ impl AffixDict {
             return true;
         }
         let mut root = String::with_capacity(w.len() + 8);
-        for p in &self.prefixes {
-            let Some(rest) = w.strip_prefix(&*p.add) else { continue };
+        // Each split point from the start: the appended prefix is `w[..b]`, found in the index.
+        let cuts = std::iter::once(0).chain(w.char_indices().skip(1).map(|(i, _)| i)).take(self.max_pfx_chars + 1);
+        let candidates = cuts.filter_map(|b| Some((w.get(b..)?, self.pfx_index.get(w.get(..b)?)?)));
+        for (rest, p) in candidates.flat_map(|(rest, rules)| rules.iter().filter_map(move |&i| Some((rest, self.prefixes.get(i as usize)?)))) {
             if rest.is_empty() {
                 continue;
             }
@@ -916,33 +941,36 @@ impl AffixDict {
             root.clear();
             root.push_str(base);
             root.push_str(&g.strip);
-            for r1 in g.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)) {
-                if !r1.cond_matches(&root, true) {
-                    continue;
-                }
-                if let Some(stem) = self.stem_mask(&root)
+            let outer: Vec<&Rule> = g.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)).filter(|r1| r1.cond_matches(&root, true)).collect();
+            if outer.is_empty() {
+                continue;
+            }
+            let root_stem = self.stem_mask(&root);
+            for &r1 in &outer {
+                if let Some(stem) = root_stem
                     && stem.meets(r1.bit)
                     && prefix.is_none_or(|p| r1.cont.meets(p.bit) || (p.cross && r1.cross && stem.meets(p.bit)))
                     && f(&Parse { stem, prefix, suffixes: [Some(r1), None] })
                 {
                     return true;
                 }
-                if prefix.is_some() {
-                    continue;
-                }
-                // Continuation classes: `root` may itself be a stem with a suffix whose
-                // continuation licenses `r1`.
-                for (base2, g2) in self.suffix_splits(&root) {
-                    inner.clear();
-                    inner.push_str(base2);
-                    inner.push_str(&g2.strip);
-                    for r2 in g2.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)) {
-                        if r2.cont.meets(r1.bit)
-                            && r2.cond_matches(&inner, true)
-                            && let Some(stem) = self.stem_mask(&inner)
-                            && stem.meets(r2.bit)
-                            && f(&Parse { stem, prefix: None, suffixes: [Some(r1), Some(r2)] })
-                        {
+            }
+            if prefix.is_some() {
+                continue;
+            }
+            // Continuation classes: `root` may itself be a stem with a suffix whose continuation
+            // licenses one of the outer rules. Its splits are walked once for all of them.
+            for (base2, g2) in self.suffix_splits(&root) {
+                inner.clear();
+                inner.push_str(base2);
+                inner.push_str(&g2.strip);
+                let Some(stem) = self.stem_mask(&inner) else { continue };
+                for r2 in g2.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)) {
+                    if !stem.meets(r2.bit) || !r2.cond_matches(&inner, true) {
+                        continue;
+                    }
+                    for &r1 in &outer {
+                        if r2.cont.meets(r1.bit) && f(&Parse { stem, prefix: None, suffixes: [Some(r1), Some(r2)] }) {
                             return true;
                         }
                     }
@@ -1026,9 +1054,10 @@ impl AffixDict {
     /// — in lower case (and capitalized), since a sentence may start with any word and headings
     /// may be in capitals. Lower-case input never matches a capitalized stem (`warszawa`), and a
     /// `KEEPCASE` stem matches only as written; a word in capitals with a hyphen may also be an
-    /// abbreviation with a lower-case ending (`SMS-ET` as `SMS-et`). Each of these readings may
-    /// also be split at its `BREAK` points, its sides then checked as written: `Petőfi-vers` and
-    /// `PETŐFI-VERS` are correct, `SÁMBOKI-HAZAY` (`Sámboki-hazay`) isn't.
+    /// abbreviation with a lower-case ending (`SMS-ET` as `SMS-et`). Failing that, the word is
+    /// split at its `BREAK` points and each side checked the same way, as Hunspell does: a word
+    /// in capitals is split capitalized (`PETŐFI-VERS` as `Petőfi-vers`, so `SÁMBOKI-HAZAY`, as
+    /// `Sámboki-hazay`, is wrong), any other as written (`alma-Fa`, `Petőfi-HÁZ` are correct).
     pub fn check(&self, w: &str) -> bool {
         self.check_except(w, Mask::EMPTY)
     }
@@ -1040,52 +1069,66 @@ impl AffixDict {
 
     fn check_except(&self, w: &str, deny: Mask) -> bool {
         let w = self.normalize(w);
-        let mut budget = compound::BREAK_BUDGET;
-        self.case_readings(&w).into_iter().any(|(v, case_deny)| {
-            let deny = deny | case_deny;
-            self.is_word(&v, deny) || self.breaks_ok(&v, deny, &mut budget)
+        self.check_case(&w, deny) || self.breaks_ok(&break_text(&w), deny, &mut compound::Breaks::new())
+    }
+
+    /// Is one of the [`AffixDict::case_readings`] of `w` (normalized) a word?
+    fn check_case(&self, w: &str, deny: Mask) -> bool {
+        self.case_readings(w).any(|(v, case_deny)| self.is_word(&v, deny | case_deny))
+    }
+
+    /// The readings of `w` [`AffixDict::check`] tries, with the flags each must not rely on,
+    /// built one at a time so the first that is a word ends the work.
+    fn case_readings<'a>(&self, w: &'a str) -> impl Iterator<Item = (std::borrow::Cow<'a, str>, Mask)> + 'a {
+        let deny = self.keepcase;
+        let case = casing(w);
+        let count = match case {
+            Casing::Lower | Casing::Mixed => 1,
+            Casing::Initial => 2,
+            Casing::Upper => 4,
+        };
+        (0..count).filter_map(move |i| {
+            let reading: std::borrow::Cow<'a, str> = match (case, i) {
+                (_, 0) => return Some((std::borrow::Cow::Borrowed(w), Mask::EMPTY)),
+                (Casing::Initial, _) | (Casing::Upper, 2) => w.to_lowercase().into(),
+                (Casing::Upper, 1) => capitalize(&w.to_lowercase()).into(),
+                _ => {
+                    let (head, tail) = w.rsplit_once('-').filter(|(_, t)| !t.is_empty())?;
+                    format!("{head}-{}", tail.to_lowercase()).into()
+                }
+            };
+            Some((reading, deny))
         })
     }
 
-    /// The readings of `w` [`AffixDict::check`] tries, with the flags each must not rely on.
-    fn case_readings(&self, w: &str) -> Vec<(String, Mask)> {
-        let mut out = vec![(w.to_string(), Mask::EMPTY)];
-        let deny = self.keepcase;
-        match casing(w) {
-            Casing::Lower | Casing::Mixed => {}
-            Casing::Initial => out.push((w.to_lowercase(), deny)),
-            Casing::Upper => {
-                let lower = w.to_lowercase();
-                out.push((capitalize(&lower), deny));
-                out.push((lower, deny));
-                if let Some((head, tail)) = w.rsplit_once('-')
-                    && !tail.is_empty()
-                {
-                    out.push((format!("{head}-{}", tail.to_lowercase()), deny));
-                }
-            }
+    /// Is `w` correct when split at its `BREAK` points? A listed `FORBIDDENWORD` stays wrong
+    /// even when its sides are right (`Rákóczi-híd`).
+    fn breaks_ok(&self, w: &str, deny: Mask, breaks: &mut compound::Breaks) -> bool {
+        !self.stem_mask(w).is_some_and(|m| m.meets(self.forbidden)) && self.check_breaks(w, deny, breaks)
+    }
+
+    /// One side of a break, checked like a whole word: in its case readings, or split again.
+    /// Each side is checked once per word.
+    fn side_ok(&self, w: &str, deny: Mask, breaks: &mut compound::Breaks) -> bool {
+        if let Some(&known) = breaks.seen.get(w) {
+            return known;
         }
-        out
+        let ok = self.check_case(w, deny) || self.breaks_ok(&break_text(w), deny, breaks);
+        breaks.seen.insert(w.to_string(), ok);
+        ok
     }
 
-    /// Is `w`, as written, correct when split at its `BREAK` points? A listed
-    /// `FORBIDDENWORD` stays wrong even when its sides are right (`Rákóczi-híd`).
-    fn breaks_ok(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
-        !self.stem_mask(w).is_some_and(|m| m.meets(self.forbidden)) && self.check_breaks(w, deny, budget)
-    }
-
-    /// One side of a break: a word as written, or one that breaks again.
-    fn side_ok(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
-        self.is_word(w, deny) || self.breaks_ok(w, deny, budget)
-    }
-
-    /// Every form of the stem `stem` (itself included), unsorted, possibly with repeats; at most
-    /// [`MAX_FORMS`], and at most [`MAX_FORMS_WORK`] rules tried along the continuation chains and
-    /// cross products, so a dictionary with thousands of self-continuing rules can't make one stem
-    /// cost millions of strings (#3613).
+    /// Every form of the stem `stem` (itself, unless it is `NEEDAFFIX`, included), unsorted,
+    /// possibly with repeats; at most [`MAX_FORMS`], and at most [`MAX_FORMS_WORK`] rules tried
+    /// along the continuation chains and cross products, so a dictionary with thousands of
+    /// self-continuing rules can't make one stem cost millions of strings (#3613). An
+    /// `ONLYINCOMPOUND` stem has none: its forms are compound parts.
     pub fn forms(&self, stem: &str) -> Vec<String> {
         let Some(f) = self.stem_flags(stem) else { return Vec::new() };
-        let mut out = vec![stem.to_string()];
+        if f.meets(self.compound.only_in) {
+            return Vec::new();
+        }
+        let mut out = if f.meets(self.compound.need_affix) { Vec::new() } else { vec![stem.to_string()] };
         let mut cross_sfx = Vec::new();
         // Suffix forms queued with the continuation classes they carry, for chained expansion;
         // each (form, classes) pair is expanded once.
