@@ -1222,8 +1222,18 @@ impl AffixDict {
     /// Much cheaper than [`AffixDict::contains`] for a dictionary that compounds, so suggestions
     /// try it first.
     pub fn contains_simple(&self, w: &str) -> bool {
+        self.simple_except(w, Mask::EMPTY)
+    }
+
+    /// [`AffixDict::contains_simple`] for words eligible for suggestions (NOSUGGEST and
+    /// SUBSTANDARD stems excluded).
+    pub fn contains_simple_suggestible(&self, w: &str) -> bool {
+        self.simple_except(w, self.no_suggest | self.substandard)
+    }
+
+    fn simple_except(&self, w: &str, deny: Mask) -> bool {
         let w = self.normalize(w);
-        !self.stem_mask(&w).is_some_and(|m| m.meets(self.forbidden)) && self.simple(&w, Mask::EMPTY)
+        !self.stem_mask(&w).is_some_and(|m| m.meets(self.forbidden)) && self.simple_reading(&w, deny) == Some(Reading::Word)
     }
 
     /// `w` after the `ICONV` conversions (at each position the longest match wins) and without

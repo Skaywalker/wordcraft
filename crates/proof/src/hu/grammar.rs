@@ -13,7 +13,9 @@
 //!   `mert`, `hanem`, `de`, `ha`, `bár`, `noha`, `mivel`, `amikor`, `ahol` and the forms of `ami`,
 //!   `aki`, `amely` — unless a conjunction or particle comes first (`és hogy`, `mint ha`, `csak
 //!   ha`, `még ha`). `mert` is also the past of `mer` (`nem mert szólni`), so it is left alone
-//!   before an infinitive or `volna` and after a negation.
+//!   before an infinitive or `volna` and after a negation; `de` is also a Latin and French word
+//!   (`de facto`, `Charles de Gaulle`), so it is left alone before those and before a name. A
+//!   word only starting like a relative pronoun (`aminosav`, `amiláza`) opens no clause.
 //! - **`a` before a vowel**: the article is `az` there (`a alma` → `az alma`). The other way round
 //!   isn't flagged, since `az` is also a pronoun (`Az kell nekem.`).
 //! - **A month after a year** is written in lower case (`2026. Október` → `2026. október`).
@@ -72,12 +74,19 @@ const CLAUSE_OPENERS: &[&str] = &[
 ];
 
 /// Stems of the relative pronouns, whose case forms open a clause too (`amit`, `akinek`,
-/// `amelyben`).
-const RELATIVE_STEMS: &[&str] = &["ami", "aki", "amely"];
+/// `amelyben`), with the plural each takes (`amik`, `akik`, `amelyek`).
+const RELATIVE_STEMS: &[(&str, &str)] = &[("ami", "k"), ("aki", "k"), ("amely", "ek"), ("amelyik", "ek")];
 
-/// Words starting like a relative pronoun that aren't one (`amiatt` points back: `amiatt,
-/// hogy`).
-const NOT_RELATIVE: &[&str] = &["amiatt", "amidőn"];
+/// The case endings of a relative pronoun: `ami` + `nek`, `amely` + `ben`, `akik` + `kel`.
+const RELATIVE_ENDINGS: &[&str] =
+    &["", "t", "et", "nek", "ben", "ből", "be", "n", "en", "ről", "re", "től", "hez", "vel", "kel", "ért", "vé", "ké", "ig", "ként"];
+
+/// Relative pronouns whose ending changes the stem (`amely` + `vel` → `amellyel`).
+const RELATIVE_ASSIMILATED: &[&str] = &["amellyel", "amellyé", "amelyikkel"];
+
+/// Words after `de` that make it the Latin or French particle (`de facto`, `de jure`), not the
+/// conjunction.
+const DE_PARTICLE_BEFORE: &[&str] = &["facto", "jure", "iure", "lege", "luxe", "novo", "visu", "minimis"];
 
 /// Words after which a clause opener takes no comma of its own: conjunctions (`és hogy`),
 /// particles (`csak ha`, `főleg mert`) and the first halves of compound conjunctions (`mint ha`,
@@ -210,8 +219,8 @@ fn spaces(text: &str, v: &mut Vec<Issue>) {
             ',' => true,
             // `;)` and `;-)` are emoticons.
             ';' => !matches!(after, Some(')' | '(' | '-' | 'P' | 'D')),
-            // ` ...` is an ellipsis, ` .5` a number.
-            '.' => !matches!(after, Some('.')) && !after.is_some_and(|a| a.is_ascii_digit()),
+            // ` ...` is an ellipsis, ` .5` a number, ` .docx` and ` .NET` names.
+            '.' => !after.is_some_and(|a| a == '.' || a.is_alphanumeric()),
             // ` :)`, ` :-)`, ` :D` and similar are emoticons; ` ?!` is still a stray space.
             ':' | '!' | '?' => after.is_none_or(|a| a.is_whitespace() || matches!(a, '"' | '”' | '»' | '’' | '!' | '?')),
             _ => false,
@@ -274,9 +283,21 @@ fn sentence_capitals(text: &str, ws: &[(usize, usize)], capital_first: bool, v: 
     }
 }
 
+/// Is `w` (lower case) a form of a relative pronoun: a stem, optionally its plural, and a case
+/// ending? (`amiatt` points back, `aminosav` is a noun: neither is one.)
+fn relative_pronoun(w: &str) -> bool {
+    RELATIVE_ASSIMILATED.contains(&w)
+        || RELATIVE_STEMS.iter().any(|&(stem, plural)| {
+            w.strip_prefix(stem).is_some_and(|rest| {
+                let rest = rest.strip_prefix(plural).unwrap_or(rest);
+                RELATIVE_ENDINGS.contains(&rest)
+            })
+        })
+}
+
 /// Does `w` (lower case) open a clause?
 fn opens_clause(w: &str) -> bool {
-    CLAUSE_OPENERS.contains(&w) || (RELATIVE_STEMS.iter().any(|s| w.starts_with(s)) && !NOT_RELATIVE.contains(&w))
+    CLAUSE_OPENERS.contains(&w) || relative_pronoun(w)
 }
 
 fn missing_commas(text: &str, ws: &[(usize, usize)], v: &mut Vec<Issue>) {
@@ -293,11 +314,12 @@ fn missing_commas(text: &str, ws: &[(usize, usize)], v: &mut Vec<Issue>) {
         if NO_COMMA_AFTER.contains(&p.as_str()) {
             continue;
         }
-        if w == "mert" {
-            let next = ws.get(k + 1).and_then(|&(na, nb)| text.get(na..nb)).unwrap_or("");
-            if MERT_VERB_BEFORE.contains(&p.as_str()) || (next.ends_with("ni") && next.chars().count() > 3) || next == "volna" {
-                continue;
-            }
+        let next = ws.get(k + 1).and_then(|&(na, nb)| text.get(na..nb)).unwrap_or("");
+        if w == "de" && (next.chars().next().is_some_and(char::is_uppercase) || DE_PARTICLE_BEFORE.contains(&next.to_lowercase().as_str())) {
+            continue;
+        }
+        if w == "mert" && (MERT_VERB_BEFORE.contains(&p.as_str()) || (next.ends_with("ni") && next.chars().count() > 3) || next == "volna") {
+            continue;
         }
         v.push(issue(pb, b, format!("Vessző kell {} „{w}” elé", article(w)), vec![format!(", {w}")]));
     }
@@ -405,6 +427,7 @@ mod tests {
         assert!(m.contains(&"Felesleges szóköz az írásjel előtt@ ?".to_string()), "{m:?}");
         assert!(m.contains(&"Dupla szóköz@  ".to_string()), "{m:?}");
         clean("Remek :) Tényleg :-) Vagy :D Az érték .5 és három pont ...");
+        clean("Megnyitottam a .docx fájlt, a .NET keretrendszerrel.");
         let m = messages("Azt mondta ,,igen” és elment.. Aztán;; vége.");
         assert_eq!(m.iter().filter(|x| x.starts_with("Kettőzött")).count(), 3, "{m:?}");
         assert_eq!(check("Azt mondta ,,igen”.").iter().find(|i| i.message.starts_with("Kettőzött")).unwrap().suggestions, ["„"]);
@@ -451,6 +474,13 @@ mod tests {
         // `mert` as the past of `mer`.
         clean("Nem mert szólni, és Péter sem mert volna.");
         clean("Amiatt késtem, mert esett.");
+        // `de` as a Latin or French particle, and words that only start like a relative pronoun.
+        clean("Ez de facto és de jure is így van. Charles de Gaulle beszélt.");
+        clean("A fehérjék aminosavai és a nyál amilázai, az aminok sói.");
+        let m = messages("Szép de drága. Ez az amelyben élünk. Láttam azt amellyel jött. Azok akikkel beszéltem.");
+        for want in ["„de”", "„amelyben”", "„amellyel”", "„akikkel”"] {
+            assert!(m.iter().any(|x| x.contains(want)), "{want}: {m:?}");
+        }
     }
 
     #[test]

@@ -17,6 +17,8 @@ REP jl lj
 REP j ly
 REP ly j
 FORBIDDENWORD W
+NOSUGGEST !
+ONLYINCOMPOUND O
 COMPOUNDFLAG Y
 COMPOUNDMIN 2
 COMPOUNDWORDMAX 2
@@ -42,7 +44,7 @@ SFX M 0 mel m
 ";
 
 /// Stems (the count line first, as in Hunspell files).
-pub const DIC: &str = "52
+pub const DIC: &str = "57
 ház/YA
 alma/YA
 fa/YA
@@ -95,6 +97,10 @@ igen
 október
 május
 fejezet
+pl.
+stb.
+ócska/!A
+kertész/YO
 ";
 
 /// Install the test dictionary as the Hungarian one.

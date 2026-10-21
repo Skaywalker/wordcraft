@@ -39,8 +39,8 @@ pub use suggest::suggest;
 /// The Hungarian dictionary: `None` until first use, then the installed one (or an empty one).
 static DICT: RwLock<Option<Arc<AffixDict>>> = RwLock::new(None);
 
-/// File names of a Hungarian Hunspell dictionary.
-const NAMES: &[&str] = &["hu_HU", "hu-HU", "hu"];
+/// File names of a Hungarian Hunspell dictionary; the first is the key of its load error.
+pub(crate) const NAMES: &[&str] = &["hu_HU", "hu-HU", "hu"];
 
 /// The Hungarian dictionary: the installed Hunspell `hu_HU` (read on first use), one given with
 /// [`install_dictionary`], or an empty one when none is available (Hungarian spelling is off then;
@@ -57,10 +57,11 @@ pub fn dictionary() -> Arc<AffixDict> {
 
 fn load_installed() -> AffixDict {
     let Some((aff, dic)) = crate::hunspell::find(NAMES) else {
+        crate::hunspell::clear_load_error(NAMES[0]);
         log::info!("Hungarian spelling: no Hunspell hu_HU dictionary installed");
         return AffixDict::default();
     };
-    crate::hunspell::load(&aff, &dic).unwrap_or_else(|e| {
+    crate::hunspell::note_load(NAMES[0], &dic, crate::hunspell::load(&aff, &dic)).unwrap_or_else(|e| {
         log::warn!("Hungarian spelling: {e}");
         AffixDict::default()
     })
@@ -101,7 +102,8 @@ fn is_latin_letter(c: char) -> bool {
 /// Is `word` spelled correctly in Hungarian? Numbers and words with digits (`2026-ban` follows
 /// the number's own rules), single letters, short words in capitals (acronyms: `MÁV`, `OTP`) and
 /// words in other scripts are accepted, and so is every word when no Hungarian dictionary is
-/// installed.
+/// installed. A word given with its period (`pl.`) may be an abbreviation the dictionary lists
+/// with it (`pl.`, `stb.`, `kb.`); without one it is checked as a word.
 pub fn is_correct(word: &str) -> bool {
     is_correct_with(&dictionary(), word)
 }
@@ -123,7 +125,8 @@ pub fn is_correct_with(d: &AffixDict, word: &str) -> bool {
     if !w.chars().any(is_latin_letter) {
         return true; // other scripts: no dictionary
     }
-    if d.check(w) || crate::in_user_dictionary(&w.to_lowercase()) {
+    let abbreviation = word.trim_end().ends_with('.') && d.check(&format!("{w}."));
+    if abbreviation || d.check(w) || crate::in_user_dictionary(&w.to_lowercase()) {
         return true;
     }
     // A hyphenated word with a part from the user dictionary: the other parts must be words.
@@ -191,6 +194,26 @@ mod tests {
         for w in ["hazban", "almafaa", "budapest", "orom", "hajlak", "almaalma", "Rákóczi-híd", "házxyz"] {
             assert!(!is_correct(w), "{w}");
         }
+    }
+
+    #[test]
+    fn abbreviations_are_checked_with_their_period() {
+        // The dictionary lists `pl.` and `stb.` with the period; without it they are no words,
+        // as with the Hunspell command line.
+        test_dict::install();
+        assert!(is_correct("pl.") && is_correct("stb.") && is_correct("Pl."));
+        assert!(!is_correct("pl") && !is_correct("stb"));
+        assert!(is_correct("ház.") && !is_correct("hazx."), "a word at the end of a sentence");
+        assert!(crate::check_spelling_in("A ház pl. szép, stb.", crate::ProofLang::Hu).is_empty());
+        let text = "A ház pl szép";
+        let issues = crate::check_spelling_in(text, crate::ProofLang::Hu);
+        assert_eq!(issues.iter().map(|i| &text[i.start..i.end]).collect::<Vec<_>>(), ["pl"]);
+    }
+
+    #[test]
+    fn a_failed_load_is_reported_under_the_hungarian_name() {
+        assert_eq!(crate::load_error_key(crate::ProofLang::Hu), Some("hu_HU"));
+        assert_eq!(NAMES.first(), Some(&"hu_HU"));
     }
 
     #[test]

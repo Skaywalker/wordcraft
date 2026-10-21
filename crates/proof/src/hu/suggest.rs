@@ -16,7 +16,9 @@
 //!    costs half (two typos at most).
 //!
 //! A candidate is first looked up without compounding; the compound search, much dearer, runs for
-//! a bounded number of candidates, and a compound ranks after a plain word at the same cost.
+//! a bounded number of candidates in each round (so the thousands of accent variants of round 2
+//! leave some for the typos of round 5), and a compound ranks after a plain word at the same
+//! cost. Words the dictionary marks `NOSUGGEST` or `SUBSTANDARD` are never suggested.
 //!
 //! The input is bounded (40 letters), and so is every round, so a call costs a few thousand
 //! dictionary lookups at most.
@@ -37,9 +39,9 @@ const MAX_MAP_CHANGES: usize = 4;
 const MAX_MAP_VARIANTS: usize = 4096;
 /// Stems the scan of round 6 expands.
 const SCAN_STEMS: usize = 48;
-/// Candidates checked as compounds per call: a compound search costs far more than a plain
-/// lookup, and the accent round alone may try thousands of spellings.
-const COMPOUND_CHECKS: usize = 300;
+/// Candidates checked as compounds in each of rounds 2 to 5: a compound search costs far more
+/// than a plain lookup, and the accent round alone may try thousands of spellings.
+const COMPOUND_CHECKS: usize = 120;
 /// A suggestion that is a word only as a compound ranks after a plain word at the same cost.
 const COST_COMPOUND: u32 = 3;
 
@@ -63,7 +65,7 @@ struct Collector<'a> {
     /// Suggestion → (cost, order found).
     found: HashMap<String, (u32, usize)>,
     seq: usize,
-    /// Compound checks left ([`COMPOUND_CHECKS`]).
+    /// Compound checks left in this round ([`COMPOUND_CHECKS`]).
     compound_checks: usize,
 }
 
@@ -77,18 +79,18 @@ impl Collector<'_> {
         let mut words = Vec::new();
         let mut cost = cost;
         for part in cand.split(' ') {
-            if self.d.contains_simple(part) {
+            if self.d.contains_simple_suggestible(part) {
                 words.push(part.to_string());
             } else if self.compound_checks > 0 && {
                 self.compound_checks -= 1;
-                self.d.contains(part)
+                self.d.contains_suggestible(part)
             } {
                 words.push(part.to_string());
                 cost += COST_COMPOUND;
             } else {
                 // Names don't compound: a capitalized reading is a plain word or nothing.
                 let c = capitalize(part);
-                if !self.d.contains_simple(&c) {
+                if !self.d.contains_simple_suggestible(&c) {
                     return;
                 }
                 words.push(c);
@@ -99,8 +101,12 @@ impl Collector<'_> {
         self.keep(words.join(" "), cost);
     }
 
-    /// Keep a suggestion known to be correct.
+    /// Keep a suggestion known to be correct, unless one of its words may not be suggested (a
+    /// `NOSUGGEST`, `SUBSTANDARD` or compound-only form from the scan of round 6).
     fn keep(&mut self, text: String, cost: u32) {
+        if !text.split(' ').all(|part| self.d.can_suggest(part)) {
+            return;
+        }
         self.seq += 1;
         let seq = self.seq;
         let e = self.found.entry(text).or_insert((cost, seq));
@@ -214,9 +220,9 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     let chars: Vec<char> = input.chars().collect();
     let mut col = Collector { d, input: input.clone(), tested: HashSet::new(), found: HashMap::new(), seq: 0, compound_checks: COMPOUND_CHECKS };
     // 1. Letter case.
-    if d.contains(&input) && word != input {
+    if d.contains_suggestible(&input) && word != input {
         col.keep(input.clone(), COST_CASE);
-    } else if d.contains(&capitalize(&input)) && word != capitalize(&input) {
+    } else if d.contains_suggestible(&capitalize(&input)) && word != capitalize(&input) {
         col.keep(capitalize(&input), COST_CASE);
     }
     // 2. Diacritics and other MAP slips.
@@ -229,6 +235,7 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
         col.offer(v, *cost);
     }
     // 3. Common confusions.
+    col.compound_checks = COMPOUND_CHECKS;
     for (from, to) in d.rep() {
         if from.is_empty() {
             continue;
@@ -241,6 +248,7 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     }
     // 4. A missing space: cheap after a short leading word or before a short trailing one,
     //    dearer between two longer words, never leaving a stray short half.
+    col.compound_checks = COMPOUND_CHECKS;
     for (i, _) in input.char_indices().skip(1) {
         let (Some(a), Some(b)) = (input.get(..i), input.get(i..)) else { continue };
         let long = |p: &str| p.chars().count() >= 3;
@@ -254,6 +262,7 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
         col.offer(&format!("{a} {b}"), cost);
     }
     // 5. One typo.
+    col.compound_checks = COMPOUND_CHECKS;
     let mut letters: Vec<char> = d.try_chars().chars().filter(|c| c.is_lowercase()).collect();
     if letters.is_empty() {
         letters = "aeoiulznrstkmbhgdáéíóöőúüűvjpfcy".chars().collect();
@@ -413,6 +422,28 @@ mod tests {
         assert!(suggest("két szó", 5).is_empty());
         assert!(suggest("öröm", 5).len() <= 5);
         assert!(!suggest("öröm", 5).contains(&"öröm".to_string()));
+    }
+
+    #[test]
+    fn nosuggest_and_compound_only_words_are_never_suggested() {
+        // `ócska` is NOSUGGEST, `kertész` only a compound part: correct where they may stand, but
+        // no round offers them, not the accents (`ocska`), not the typos and not the scan.
+        crate::hu::test_dict::install();
+        let d = crate::hu::dictionary();
+        assert!(d.check("ócska") && d.check("ócskában") && d.check("kertészház") && !d.check("kertész"));
+        for w in ["ocska", "ócskx", "ocskaban", "kertesz", "kertészx", "ócskaa"] {
+            let s = suggest(w, 8);
+            assert!(!s.iter().any(|x| x.to_lowercase().contains("ócska") || x == "kertész"), "{w} → {s:?}");
+        }
+        crate::affix::tests::assert_nosuggest_is_honoured(suggest_in);
+    }
+
+    #[test]
+    fn every_round_gets_compound_checks() {
+        // Hundreds of accent variants (each `ö`, `u` and `a` has relatives) must not use up the
+        // compound checks of the typo round: `örömkönyvkulcsalma` is a compound one typo away.
+        crate::hu::test_dict::install();
+        has("örömkönyvkulcsalmax", "örömkönyvkulcsalma");
     }
 
     #[test]

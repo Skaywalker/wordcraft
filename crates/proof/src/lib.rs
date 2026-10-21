@@ -205,7 +205,12 @@ pub fn installed_dictionaries() -> Vec<(ProofLang, Option<std::path::PathBuf>)> 
 /// error), if it was read and failed. Doesn't read anything itself: a dictionary nobody has
 /// checked yet reports `None` (#2830).
 pub fn dictionary_load_error(lang: ProofLang) -> Option<String> {
-    let key = match lang {
+    hunspell::load_error(load_error_key(lang)?).map(|(_, reason)| reason)
+}
+
+/// The name a language's dictionary load error is kept under (see [`hunspell::note_load`]).
+fn load_error_key(lang: ProofLang) -> Option<&'static str> {
+    Some(match lang {
         ProofLang::Pl => "pl_PL",
         ProofLang::Pt => "pt_BR",
         ProofLang::It => "it_IT",
@@ -213,9 +218,9 @@ pub fn dictionary_load_error(lang: ProofLang) -> Option<String> {
         ProofLang::Tr => "tr_TR",
         ProofLang::Id => "id_ID",
         ProofLang::Es | ProofLang::EsMx | ProofLang::Es419 | ProofLang::EsUy => es::dictionary_name(lang),
+        ProofLang::Hu => hu::NAMES[0],
         _ => return None,
-    };
-    hunspell::load_error(key).map(|(_, reason)| reason)
+    })
 }
 
 /// A number that changes whenever a word is added to or removed from the user dictionary, or the
@@ -743,8 +748,14 @@ pub(crate) fn is_address(token: &str) -> bool {
 /// classification of the word's enclosing token, from [`enclosing_token`].
 fn spelling_issue(text: &str, a: usize, b: usize, lang: ProofLang, opts: &Options, internet: bool) -> Option<Issue> {
     let w = text.get(a..b)?;
+    // A Hungarian abbreviation is listed with its period (`pl.`, `stb.`), which isn't part of the word.
+    let with_period = (lang == ProofLang::Hu && text.get(b..).is_some_and(|r| r.starts_with('.'))).then(|| text.get(a..b + 1)).flatten();
     // A word with a Vietnamese-only letter (a name like Nguyễn in English text) isn't English.
-    if (opts.ignore_internet && internet) || (lang.is_english() && vi::is_vietnamese_word(w)) || is_correct_in_with(w, lang, opts) {
+    if (opts.ignore_internet && internet)
+        || (lang.is_english() && vi::is_vietnamese_word(w))
+        || is_correct_in_with(w, lang, opts)
+        || with_period.is_some_and(|wp| is_correct_in_with(wp, lang, opts))
+    {
         return None;
     }
     let message = match lang {

@@ -1,6 +1,6 @@
 # Hungarian interface
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-23 · **Change:** minor (Hungarian proofing: spelling, suggestions, grammar, hyphenation; previously trivial: the catalog moved to storytold/craft-i18n, `locales/hu/wordcraft.tsv`; previously trivial: interface-language tests: a missing translation never fails a test, `cargo xtask i18n-report` in `cargo xtask ci` prints the strings each language lacks, and lookup and template tests use inline fixture catalogs or the pseudo-language; previously trivial: the interface audit lists missing Hungarian entries instead of failing; previously minor: Hungarian interface catalog and regression checks) · **Target:** WordCraft 0.5.0
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-23 · **Change:** trivial (abbreviations with their period, no NOSUGGEST suggestions, fewer false comma and space marks; previously minor: Hungarian proofing: spelling, suggestions, grammar, hyphenation; previously trivial: the catalog moved to storytold/craft-i18n, `locales/hu/wordcraft.tsv`; previously trivial: interface-language tests: a missing translation never fails a test, `cargo xtask i18n-report` in `cargo xtask ci` prints the strings each language lacks, and lookup and template tests use inline fixture catalogs or the pseudo-language; previously trivial: the interface audit lists missing Hungarian entries instead of failing; previously minor: Hungarian interface catalog and regression checks) · **Target:** WordCraft 0.5.0
 
 Choose **File › Options › Interface language › Magyar**, or follow a Hungarian system display
 language (`hu-HU`, `hu_HU.UTF-8`). The catalog code is `hu`; `ui.language` with `{"value":"hu"}`
@@ -76,13 +76,19 @@ writes new documents in Hungarian.
   marks. The affix engine reads the dictionary's flag aliases, compounding rules and word breaks,
   so compounds (`almafa`, `házkulcsban`), the 6–3 rule for long ones, and hyphenated forms
   (`SMS-ben`, `Petőfi-vers`) are checked as Hunspell checks them: on 31,248 test words labelled by
-  the Hunspell command line, the results agree on 99.7%.
+  the Hunspell command line, the results agree on 99.7%. Abbreviations the dictionary lists with
+  their period (`pl.`, `stb.`, `kb.`) are correct with it and wrong without it.
 - **Suggestions**: missing accents first (`hazban` → `házban`), the dictionary's confusion table
   (`hejesírás` → `helyesírás`), a missing space (`nemis` → `nem is`), one typo, then a stem scan.
+  Words the dictionary marks `NOSUGGEST` or `SUBSTANDARD`, and compound-only parts, are never
+  suggested.
 - **Grammar**, with Hungarian messages: repeated word, space before punctuation, double space,
   sentence capital (knowing `pl.`, `stb.`, ordinals and dates), a missing comma before `hogy`,
   `mert`, `hanem`, `de`, `ha` and the relative pronouns, `a` before a vowel (`az alma`), a capital
-  month after a year, doubled punctuation.
+  month after a year, doubled punctuation. `de facto`, `de jure` and `de` before a name
+  (`Charles de Gaulle`) take no comma, words that only start like a relative pronoun
+  (`aminosav`) open no clause, and a space before a file extension (`a .docx fájl`) is no stray
+  space.
 - **Hyphenation** with the Hungarian patterns installed on the system (`hyph_hu_HU.dic`, the
   `hyphen-hu` package or LibreOffice), which know compound boundaries; without them, the
   Hungarian syllable rules. A doubled digraph (`ssz` in `asszony`) changes its spelling when
@@ -105,5 +111,6 @@ and contain no data from either.
 | 2026-10-23 | trivial | Lookup, context, template, style-name and command-search tests use inline fixture catalogs or the pseudo-language; tests that asserted one language's catalog wording removed |
 | 2026-10-23 | trivial | Interface-language tests: a missing translation falls back to English and never fails a test; `cargo xtask i18n-report` (part of `cargo xtask ci`) prints the strings each language lacks; single-language coverage tests removed |
 | 2026-10-23 | trivial | The interface audit lists Hungarian strings the catalog lacks; a missing entry doesn't fail the audit |
+| 2026-10-21 | trivial | Review fixes: abbreviations checked with their period, NOSUGGEST and compound-only words never suggested, no comma asked before `de facto` or a name, relative pronouns told by their endings, a space before `.docx` left alone |
 | 2026-10-15 | minor | Hungarian proofing: spelling with the installed `hu_HU` dictionary (compounds, word breaks), suggestions, grammar rules, hyphenation with the installed patterns or the syllable rules; the dictionary licence |
 | 2026-10-11 | minor | Hungarian catalog (2,419 entries: built-in style names, equation gallery, citation styles), conventions, terminology, scope and regression checks |
