@@ -187,6 +187,25 @@ fn player_finishes_on_its_own() {
 }
 
 #[test]
+fn play_after_a_halt_carries_on_and_clears_the_message() {
+    // Another program stopped the sentence: reading paused on it with a message, and Play
+    // goes on from the same sentence.
+    let mut r = ReadAloud::default();
+    r.backend = Backend::Hold;
+    r.start(sentences(&Document::from_text("One. Two."), &Pos::body(0, 0), None, true));
+    {
+        let mut s = lock(&r.shared.0);
+        s.state = State::Paused;
+        s.error = Some("stopped by another program".into());
+    }
+    r.play_pause();
+    assert_eq!(r.state(), State::Playing);
+    assert_eq!(r.progress().0, 0);
+    assert_eq!(r.error(), None);
+    r.stop();
+}
+
+#[test]
 fn empty_queue_does_not_play() {
     let mut r = ReadAloud::default();
     r.start(Vec::new());
@@ -288,10 +307,18 @@ fn speech_dispatcher_rate_follows_the_speed() {
 
 #[test]
 fn speech_dispatcher_keeps_the_region() {
-    assert_eq!(dispatcher_language(Some("en-GB")), Some("en-GB"));
-    assert_eq!(dispatcher_language(Some(" pt-BR ")), Some("pt-BR"));
-    assert_eq!(dispatcher_language(Some("zh-TW")), Some("zh-TW"));
-    assert_eq!(dispatcher_language(Some("hu")), Some("hu"));
+    let tag = |t| dispatcher_language(Some(t));
+    assert_eq!(tag("en-GB").as_deref(), Some("en-GB"));
+    assert_eq!(tag(" pt-BR ").as_deref(), Some("pt-BR"));
+    assert_eq!(tag("zh-TW").as_deref(), Some("zh-TW"));
+    assert_eq!(tag("hu").as_deref(), Some("hu"));
+    assert_eq!(tag("HU-hu").as_deref(), Some("hu-HU"));
+    // SSIP takes language and region: script and variant subtags are left out.
+    assert_eq!(tag("sr-Latn-RS").as_deref(), Some("sr-RS"));
+    assert_eq!(tag("zh-Hant-TW").as_deref(), Some("zh-TW"));
+    assert_eq!(tag("es-419").as_deref(), Some("es-419"));
+    assert_eq!(tag("de-CH-1996").as_deref(), Some("de-CH"));
+    assert_eq!(tag("sr-Cyrl").as_deref(), Some("sr"));
     assert_eq!(dispatcher_language(Some("x-none")), None);
     assert_eq!(dispatcher_language(Some("hu\r\nQUIT")), None);
     assert_eq!(dispatcher_language(None), None);

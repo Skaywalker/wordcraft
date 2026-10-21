@@ -407,19 +407,44 @@ fn speak_dispatcher(text: &str, lang: Option<&str>, rate: f32, changed: &dyn Fn(
         ssip::Connection::Interrupted => return Some(Spoken::Interrupted),
         ssip::Connection::Unreachable(why) => return Some(Spoken::Failed(format!("Read Aloud couldn't reach Speech Dispatcher: {why}"))),
     };
-    let req = ssip::Request { text, rate: spd_rate(rate), lang: dispatcher_language(lang) };
+    let lang = dispatcher_language(lang);
+    let req = ssip::Request { text, rate: spd_rate(rate), lang: lang.as_deref() };
     Some(match ssip::converse(&stream, &req, changed) {
         Ok(ssip::Outcome::Done) => Spoken::Done,
         Ok(ssip::Outcome::Interrupted) => Spoken::Interrupted,
+        Ok(ssip::Outcome::Halted) => Spoken::Halted(HALTED_BY_OTHER.into()),
         Err(e) => Spoken::Failed(format!("Read Aloud couldn't use Speech Dispatcher: {e}")),
     })
 }
 
-/// The language tag Speech Dispatcher is given for a sentence in `lang`: the whole tag, when it
-/// names a language (Word's `x-none` doesn't).
+/// Why reading paused when another program cancelled or paused the sentence.
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+const HALTED_BY_OTHER: &str =
+    "Speech Dispatcher stopped the sentence for another program (a screen reader, or a stop for every program): press Play to go on";
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+thread_local! {
+    /// Neither espeak command was found during this reading (the worker thread lives as long as
+    /// one reading): the next sentences go straight to Speech Dispatcher.
+    static NO_ESPEAK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The language tag Speech Dispatcher is given for a sentence in `lang`: its language and region,
+/// as SSIP's `SET LANGUAGE` takes them (`sr-Latn-RS` gives `sr-RS`, `zh-Hant-TW` gives `zh-TW`),
+/// when it names a language (Word's `x-none` doesn't).
 #[cfg(any(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")), test))]
-fn dispatcher_language(lang: Option<&str>) -> Option<&str> {
-    lang.and_then(plain_tag).filter(|t| primary_tag(t).is_some())
+fn dispatcher_language(lang: Option<&str>) -> Option<String> {
+    let tag = lang.and_then(plain_tag)?;
+    let primary = primary_tag(tag)?;
+    let region = tag
+        .split('-')
+        .skip(1)
+        .take(2)
+        .find(|t| (t.len() == 2 && t.chars().all(|c| c.is_ascii_alphabetic())) || (t.len() == 3 && t.chars().all(|c| c.is_ascii_digit())));
+    Some(match region {
+        Some(r) => format!("{primary}-{}", r.to_ascii_uppercase()),
+        None => primary,
+    })
 }
 
 /// Should `speak` say the sentence again with the default voice? When it gave the program a voice
@@ -660,6 +685,7 @@ impl ReadAloud {
                     if s.index >= s.queue.len() {
                         s.index = 0;
                     }
+                    s.error = None;
                     State::Playing
                 }
             };
@@ -773,6 +799,9 @@ impl Drop for ReadAloud {
 enum Spoken {
     Done,
     Interrupted,
+    /// Another program stopped the sentence: reading pauses on it, saying why.
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+    Halted(String),
     Failed(String),
 }
 
@@ -824,6 +853,10 @@ fn worker(shared: &(Mutex<Shared>, Condvar), backend: Backend) {
                 }
             }
             Spoken::Interrupted => {}
+            Spoken::Halted(why) => {
+                s.state = State::Paused;
+                s.error = Some(why);
+            }
             Spoken::Failed(e) => {
                 s.state = State::Stopped;
                 s.error = Some(e);
@@ -926,7 +959,8 @@ fn speak_with(text: &str, lang: Option<&str>, rate: f32, changed: &dyn Fn() -> b
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        for prog in ["espeak-ng", "espeak"] {
+        let programs: &[&str] = if NO_ESPEAK.get() { &[] } else { &["espeak-ng", "espeak"] };
+        for prog in programs {
             let args = espeak_args(&wpm, lang);
             let voiced = args.iter().any(|a| a == "-v");
             let mut c = Command::new(prog);
@@ -953,8 +987,11 @@ fn speak_with(text: &str, lang: Option<&str>, rate: f32, changed: &dyn Fn() -> b
     let Some((mut child, voiced)) = child else {
         // Speech Dispatcher, which many desktops install without the espeak command.
         #[cfg(all(unix, not(target_os = "macos")))]
-        if not_found && let Some(spoken) = speak_dispatcher(text, lang, rate, changed) {
-            return (spoken, false, None);
+        if not_found {
+            NO_ESPEAK.set(true);
+            if let Some(spoken) = speak_dispatcher(text, lang, rate, changed) {
+                return (spoken, false, None);
+            }
         }
         let message = if not_found { MISSING_PROGRAM.to_string() } else { format!("Read Aloud couldn't start the speech program: {last_err}") };
         return (Spoken::Failed(message), false, None);
