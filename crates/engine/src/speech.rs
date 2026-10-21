@@ -767,19 +767,80 @@ fn installed_voices() -> Option<Arc<[Voice]>> {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        // Browsers load their voices after the page; until they arrive (or a while has passed
-        // without any), the list is pending.
+        // Browsers load their voices after the page. A list that arrived is kept; an empty one is
+        // asked for again at every call, pending for a while after the first.
         static WEB_VOICES: std::sync::OnceLock<Arc<[Voice]>> = std::sync::OnceLock::new();
-        static ASKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static FIRST_ASKED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
         if let Some(v) = WEB_VOICES.get() {
             return Some(Arc::clone(v));
         }
         let list = web::voices();
-        if list.is_empty() && ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
-            return None;
+        if !list.is_empty() {
+            return Some(Arc::clone(WEB_VOICES.get_or_init(|| list.into())));
         }
-        Some(Arc::clone(WEB_VOICES.get_or_init(|| list.into())))
+        let waited = js_sys::Date::now() - *FIRST_ASKED.get_or_init(js_sys::Date::now);
+        (!web_voices_pending(waited)).then(|| Arc::new([]) as Arc<[Voice]>)
     }
+}
+
+/// How long the browser's voice list stays pending while it is empty, in milliseconds.
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_VOICES_WAIT_MS: f64 = 5000.0;
+
+/// Is an empty browser voice list still pending, `waited_ms` after it was first asked for?
+#[cfg(any(target_arch = "wasm32", test))]
+fn web_voices_pending(waited_ms: f64) -> bool {
+    waited_ms < WEB_VOICES_WAIT_MS
+}
+
+/// How often the browser player says a sentence again that was cancelled from outside it.
+#[cfg(any(target_arch = "wasm32", test))]
+const MAX_WEB_RESENDS: usize = 2;
+
+/// How the browser player is trying a sentence.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WebAttempt {
+    /// Without the sentence's language and voice (the browser couldn't speak it with them).
+    plain: bool,
+    /// How often it was said again after a cancel from outside the player.
+    resends: usize,
+}
+
+/// What the browser player does after an `error` event.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum WebRetry {
+    /// Say the sentence again, this way.
+    Again(WebAttempt),
+    /// Pause on the sentence (Play carries on from it).
+    Pause,
+    /// Stop with the error.
+    Stop,
+}
+
+/// What follows the browser's `error` event `code` for a sentence tried as `attempt`, which was
+/// given a language or a voice when `tailored`. The player's own cancel detaches the handler
+/// first, so `interrupted` and `canceled` come from outside it (another script on the page): the
+/// sentence is said again, twice at most, then reading pauses. A language or voice the browser
+/// can't speak gives way to its default voice, as on the desktop: a missing voice must never mean
+/// silence.
+#[cfg(any(target_arch = "wasm32", test))]
+fn web_retry(code: &str, attempt: WebAttempt, tailored: bool) -> WebRetry {
+    match code {
+        "interrupted" | "canceled" if attempt.resends < MAX_WEB_RESENDS => WebRetry::Again(WebAttempt { resends: attempt.resends + 1, ..attempt }),
+        "interrupted" | "canceled" => WebRetry::Pause,
+        "language-unavailable" | "voice-unavailable" | "synthesis-failed" if tailored && !attempt.plain => {
+            WebRetry::Again(WebAttempt { plain: true, ..attempt })
+        }
+        _ => WebRetry::Stop,
+    }
+}
+
+/// Is `owner` the player `player` (the same shared state)?
+#[cfg(any(target_arch = "wasm32", test))]
+fn same_player<T>(owner: &std::sync::Weak<T>, player: &Arc<T>) -> bool {
+    std::ptr::eq(owner.as_ptr(), Arc::as_ptr(player))
 }
 
 /// The installed voice `id`, waiting while the list is asked for the first time, but no longer
@@ -1298,7 +1359,7 @@ impl Drop for ReadAloud {
         }
         #[cfg(target_arch = "wasm32")]
         if self.backend == Backend::System {
-            web::cancel();
+            web::cancel_for(&self.shared);
         }
     }
 }

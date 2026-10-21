@@ -522,6 +522,41 @@ fn a_chosen_voice_reads_text_tagged_with_the_default_language() {
 }
 
 #[test]
+fn the_browser_player_says_an_interrupted_sentence_again() {
+    let first = WebAttempt::default();
+    // Cancelled from outside: said again, twice at most, then reading pauses on it.
+    assert_eq!(web_retry("interrupted", first, true), WebRetry::Again(WebAttempt { plain: false, resends: 1 }));
+    assert_eq!(web_retry("canceled", WebAttempt { plain: false, resends: 1 }, false), WebRetry::Again(WebAttempt { plain: false, resends: 2 }));
+    assert_eq!(web_retry("canceled", WebAttempt { plain: false, resends: MAX_WEB_RESENDS }, false), WebRetry::Pause);
+    // A language or voice the browser lacks: once more in its default voice, then an error.
+    for code in ["language-unavailable", "voice-unavailable", "synthesis-failed"] {
+        assert_eq!(web_retry(code, first, true), WebRetry::Again(WebAttempt { plain: true, resends: 0 }), "{code}");
+        assert_eq!(web_retry(code, WebAttempt { plain: true, resends: 0 }, false), WebRetry::Stop, "{code}");
+        assert_eq!(web_retry(code, first, false), WebRetry::Stop, "nothing to leave out: {code}");
+    }
+    assert_eq!(web_retry("not-allowed", first, true), WebRetry::Stop);
+    assert_eq!(web_retry("", first, true), WebRetry::Stop);
+}
+
+#[test]
+fn the_browser_voice_list_waits_a_while_for_its_voices() {
+    assert!(web_voices_pending(0.0));
+    assert!(web_voices_pending(WEB_VOICES_WAIT_MS - 1.0));
+    assert!(!web_voices_pending(WEB_VOICES_WAIT_MS));
+    assert!(!web_voices_pending(f64::NAN), "a broken clock never keeps it pending");
+}
+
+#[test]
+fn only_the_reading_player_stops_the_browser_speech() {
+    // The utterance remembers its player; dropping another one (a template preview's
+    // session) leaves it alone.
+    let (reading, preview) = (Arc::new(1), Arc::new(1));
+    let owner = Arc::downgrade(&reading);
+    assert!(same_player(&owner, &reading));
+    assert!(!same_player(&owner, &preview));
+}
+
+#[test]
 fn the_chosen_voice_is_kept_and_reported() {
     let mut r = ReadAloud::default();
     assert_eq!(r.status()["voice"], Value::Null);
