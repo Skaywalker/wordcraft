@@ -10,12 +10,15 @@
 //! letters (Cyrillic, Greek, Arabic, Hebrew, CJK, Thai…), so a Russian sentence gets a Russian voice
 //! where one is installed instead of being spelled out letter by letter. The system's own voice
 //! stays whenever it already speaks the language (English text on an English system keeps the
-//! voice the user chose), and without a voice for the language the default voice speaks.
+//! voice the user chose), and without a voice for the language the default voice speaks. Speech
+//! Dispatcher is the exception: it can't be asked for its default language, so it is told the
+//! language of every sentence.
 //!
 //! The speech itself runs on a worker thread (desktop only): it starts `say` (macOS), `espeak-ng`
-//! / `espeak` or else Speech Dispatcher's `spd-say` (Linux, BSD) or the Windows speech synthesizer
-//! (PowerShell) for the current sentence, and moves on when it finishes. Commands only change the shared state and wake the
-//! worker, which stops the running sentence when the state changed under it.
+//! / `espeak` (Linux, BSD) or the Windows speech synthesizer (PowerShell) for the current sentence,
+//! or talks to Speech Dispatcher over its socket when neither espeak is installed, and moves on when
+//! the sentence ends. Commands only change the shared state and wake the worker, which stops the
+//! running sentence when the state changed under it.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
@@ -393,18 +396,30 @@ fn spd_rate(rate: f32) -> i32 {
 }
 
 /// Say one sentence through Speech Dispatcher ([`ssip`]), in the sentence's language whenever it
-/// has one: Speech Dispatcher's default language is its own setting (often the system locale), so
-/// English is named too. `None` when there is no Speech Dispatcher to talk to.
+/// has one, region included (its voices are per region: `en-GB`, `pt-BR`). Its default language is
+/// its own setting (`en-US` unless configured), which SSIP can't ask for, so English is named too.
+/// `None` when Speech Dispatcher isn't installed.
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn speak_dispatcher(text: &str, lang: Option<&str>, rate: f32, changed: &dyn Fn() -> bool) -> Option<Spoken> {
-    let stream = ssip::connect()?;
-    let lang = lang.and_then(primary_tag);
-    let req = ssip::Request { text, rate: spd_rate(rate), lang: lang.as_deref(), voice: None };
+    let stream = match ssip::connect(changed) {
+        ssip::Connection::Open(s) => s,
+        ssip::Connection::Missing => return None,
+        ssip::Connection::Interrupted => return Some(Spoken::Interrupted),
+        ssip::Connection::Unreachable(why) => return Some(Spoken::Failed(format!("Read Aloud couldn't reach Speech Dispatcher: {why}"))),
+    };
+    let req = ssip::Request { text, rate: spd_rate(rate), lang: dispatcher_language(lang) };
     Some(match ssip::converse(&stream, &req, changed) {
         Ok(ssip::Outcome::Done) => Spoken::Done,
         Ok(ssip::Outcome::Interrupted) => Spoken::Interrupted,
         Err(e) => Spoken::Failed(format!("Read Aloud couldn't use Speech Dispatcher: {e}")),
     })
+}
+
+/// The language tag Speech Dispatcher is given for a sentence in `lang`: the whole tag, when it
+/// names a language (Word's `x-none` doesn't).
+#[cfg(any(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")), test))]
+fn dispatcher_language(lang: Option<&str>) -> Option<&str> {
+    lang.and_then(plain_tag).filter(|t| primary_tag(t).is_some())
 }
 
 /// Should `speak` say the sentence again with the default voice? When it gave the program a voice
