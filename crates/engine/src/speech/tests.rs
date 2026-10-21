@@ -548,12 +548,25 @@ fn the_browser_voice_list_waits_a_while_for_its_voices() {
 
 #[test]
 fn only_the_reading_player_stops_the_browser_speech() {
-    // The utterance remembers its player; dropping another one (a template preview's
-    // session) leaves it alone.
+    // The utterance remembers its player. That player may always stop it; another one only
+    // when it starts playing itself, never by going away or changing while stopped (a
+    // template preview's session).
     let (reading, preview) = (Arc::new(1), Arc::new(1));
     let owner = Arc::downgrade(&reading);
-    assert!(same_player(&owner, &reading));
-    assert!(!same_player(&owner, &preview));
+    assert!(may_cancel(Some(&owner), &reading, false));
+    assert!(may_cancel(Some(&owner), &reading, true));
+    assert!(!may_cancel(Some(&owner), &preview, false));
+    assert!(may_cancel(Some(&owner), &preview, true), "a player that starts reading takes over");
+    assert!(!may_cancel(None, &preview, false), "nothing spoken: nothing to stop");
+}
+
+#[test]
+fn the_browser_gets_a_bounded_time_per_sentence() {
+    assert_eq!(web_sentence_limit_ms(0, 1.0), 30_000.0);
+    assert_eq!(web_sentence_limit_ms(600, 1.0), 270_000.0);
+    assert_eq!(web_sentence_limit_ms(600, 3.0), 270_000.0, "never shorter when faster");
+    assert_eq!(web_sentence_limit_ms(0, MIN_RATE), 60_000.0, "longer when slower");
+    assert_eq!(web_sentence_limit_ms(0, f32::NAN), 30_000.0);
 }
 
 #[test]

@@ -767,19 +767,9 @@ fn installed_voices() -> Option<Arc<[Voice]>> {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        // Browsers load their voices after the page. A list that arrived is kept; an empty one is
-        // asked for again at every call, pending for a while after the first.
-        static WEB_VOICES: std::sync::OnceLock<Arc<[Voice]>> = std::sync::OnceLock::new();
-        static FIRST_ASKED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-        if let Some(v) = WEB_VOICES.get() {
-            return Some(Arc::clone(v));
-        }
-        let list = web::voices();
-        if !list.is_empty() {
-            return Some(Arc::clone(WEB_VOICES.get_or_init(|| list.into())));
-        }
-        let waited = js_sys::Date::now() - *FIRST_ASKED.get_or_init(js_sys::Date::now);
-        (!web_voices_pending(waited)).then(|| Arc::new([]) as Arc<[Voice]>)
+        // Browsers load their voices after the page: an empty list is pending for a while.
+        let (list, waited) = web::voices();
+        (!list.is_empty() || !web_voices_pending(waited)).then_some(list)
     }
 }
 
@@ -837,10 +827,21 @@ fn web_retry(code: &str, attempt: WebAttempt, tailored: bool) -> WebRetry {
     }
 }
 
-/// Is `owner` the player `player` (the same shared state)?
+/// May `player` stop the browser's speech? When it is `playing` (it takes over the speech), or
+/// when the sentence being spoken is its own (`owner`): a player that changes while stopped, or
+/// goes away (the session a template preview builds and drops), leaves another's reading alone.
 #[cfg(any(target_arch = "wasm32", test))]
-fn same_player<T>(owner: &std::sync::Weak<T>, player: &Arc<T>) -> bool {
-    std::ptr::eq(owner.as_ptr(), Arc::as_ptr(player))
+fn may_cancel<T>(owner: Option<&std::sync::Weak<T>>, player: &Arc<T>, playing: bool) -> bool {
+    playing || owner.is_some_and(|o| std::sync::Weak::ptr_eq(o, &Arc::downgrade(player)))
+}
+
+/// How long the browser gets for a sentence of `chars` characters at `rate` before the player
+/// gives up on it, in milliseconds: far more than the slowest reading takes, so only a browser
+/// that never reports the end (some drop long utterances silently) reaches it.
+#[cfg(any(target_arch = "wasm32", test))]
+fn web_sentence_limit_ms(chars: usize, rate: f32) -> f64 {
+    let rate = if rate.is_finite() { rate.clamp(MIN_RATE, 1.0) } else { 1.0 };
+    (30_000.0 + 400.0 * chars as f64) / f64::from(rate)
 }
 
 /// The installed voice `id`, waiting while the list is asked for the first time, but no longer

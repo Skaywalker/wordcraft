@@ -6,8 +6,9 @@
 //! stop, a new speed) cancels the utterance and speaks the current sentence again if still playing.
 //! The generation and the sentence index an utterance was started for keep a late event of a
 //! cancelled one from moving the player. An utterance cancelled from outside the player (another
-//! script on the page) is spoken again, and one the browser can't speak in its language or voice
-//! is spoken in the default voice, as on the desktop ([`super::web_retry`]).
+//! script on the page) is spoken again, one the browser can't speak in its language or voice is
+//! spoken in the default voice, as on the desktop ([`super::web_retry`]), and one the browser never
+//! reports the end of stops reading after a while ([`super::web_sentence_limit_ms`]).
 
 use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -16,69 +17,165 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{SpeechSynthesis, SpeechSynthesisUtterance, SpeechSynthesisVoice};
 
-use super::{Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, lock, plain_tag, same_player, voice_for, web_retry};
+use super::{Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, lock, may_cancel, plain_tag, voice_for, web_retry, web_sentence_limit_ms};
 
 type Handler = Closure<dyn FnMut(web_sys::Event)>;
+type Timer = Closure<dyn FnMut()>;
 type Player = (Mutex<Shared>, Condvar);
 
-/// The utterance being spoken, its event handler, and the player it speaks for.
+/// The utterance being spoken, its event handler, the player it speaks for, and the timer that
+/// gives up on it.
 struct Current {
     utterance: SpeechSynthesisUtterance,
     handler: Handler,
     player: Weak<Player>,
+    watchdog: Option<(i32, Timer)>,
+}
+
+/// The browser's voices, as listed and as the browser's own objects (same order), and when they
+/// were asked for.
+struct Voices {
+    listed: Arc<[Voice]>,
+    browser: Vec<SpeechSynthesisVoice>,
+    asked: f64,
 }
 
 thread_local! {
     static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
-    /// The previous handler, kept until the next cancel replaces it: the handler that ends a
-    /// sentence is still running when it starts the next one, and must not be dropped meanwhile.
-    static RETIRED: RefCell<Option<Handler>> = const { RefCell::new(None) };
+    /// A sentence waiting to be spoken once the browser has handled a cancel, and its timer.
+    static DEFERRED: RefCell<Option<(i32, Timer)>> = const { RefCell::new(None) };
+    /// Closures replaced while they may still be running (a handler that ends a sentence starts
+    /// the next one): kept until later replacements push them out.
+    static RETIRED_HANDLERS: RefCell<Vec<Handler>> = const { RefCell::new(Vec::new()) };
+    static RETIRED_TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
+    static VOICES: RefCell<Option<Voices>> = const { RefCell::new(None) };
+    /// When the voices were first asked for (ms), and the `voiceschanged` listener.
+    static FIRST_ASKED: RefCell<Option<f64>> = const { RefCell::new(None) };
+    static VOICES_CHANGED: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
 }
+
+/// How many replaced closures are kept alive.
+const RETIRED_KEPT: usize = 4;
+/// An empty voice list is asked for again at most this often (ms).
+const EMPTY_VOICES_AGAIN_MS: f64 = 1000.0;
 
 /// What Read Aloud says when the browser has no speech synthesis.
 const UNAVAILABLE: &str = "Read Aloud isn't available in this browser";
 
+/// The browser's speech synthesis. `None` when the browser has none: some (Tor Browser,
+/// LibreWolf, Firefox with speech turned off) leave `window.speechSynthesis` undefined, and
+/// calling into it would throw.
 fn synth() -> Option<SpeechSynthesis> {
-    web_sys::window()?.speech_synthesis().ok()
+    web_sys::window()?.speech_synthesis().ok().filter(|s| !s.is_undefined() && !s.is_null())
 }
 
-/// Stop the sentence being spoken and detach its handler. The browser is told to cancel only when
-/// it has something to cancel: Chrome and Safari can drop an utterance spoken right after a cancel,
-/// which would otherwise happen at every sentence end.
-pub(super) fn cancel() {
+fn retire_handler(h: Handler) {
+    RETIRED_HANDLERS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.push(h);
+        let extra = r.len().saturating_sub(RETIRED_KEPT);
+        r.drain(..extra);
+    });
+}
+
+fn retire_timer(id: i32, t: Timer) {
+    if let Some(w) = web_sys::window() {
+        w.clear_timeout_with_handle(id);
+    }
+    RETIRED_TIMERS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.push(t);
+        let extra = r.len().saturating_sub(RETIRED_KEPT);
+        r.drain(..extra);
+    });
+}
+
+/// Start `f` after `ms` milliseconds; the timer's id and closure, which must live until then.
+fn after(ms: f64, f: impl FnMut() + 'static) -> Option<(i32, Timer)> {
+    let t: Timer = Closure::new(f);
+    let ms = if ms.is_finite() { ms.clamp(0.0, f64::from(i32::MAX)) as i32 } else { i32::MAX };
+    let id = web_sys::window()?.set_timeout_with_callback_and_timeout_and_arguments_0(t.as_ref().unchecked_ref(), ms).ok()?;
+    Some((id, t))
+}
+
+/// Stop the sentence being spoken (and one waiting to be spoken) and detach its handlers. Returns
+/// whether the browser was told to cancel: only when it had something to cancel, since Chrome and
+/// Safari can drop an utterance spoken right after a cancel.
+fn cancel() -> bool {
+    if let Some((id, t)) = DEFERRED.with(|d| d.borrow_mut().take()) {
+        retire_timer(id, t);
+    }
     if let Some(c) = CURRENT.with(|c| c.borrow_mut().take()) {
         c.utterance.set_onend(None);
         c.utterance.set_onerror(None);
-        RETIRED.with(|r| *r.borrow_mut() = Some(c.handler));
+        retire_handler(c.handler);
+        if let Some((id, t)) = c.watchdog {
+            retire_timer(id, t);
+        }
     }
-    if let Some(s) = synth()
-        && (s.speaking() || s.pending())
-    {
-        s.cancel();
+    match synth() {
+        Some(s) if s.speaking() || s.pending() => {
+            s.cancel();
+            true
+        }
+        _ => false,
     }
+}
+
+/// The owner of the sentence being spoken.
+fn owner() -> Option<Weak<Player>> {
+    CURRENT.with(|c| c.borrow().as_ref().map(|c| c.player.clone()))
 }
 
 /// [`cancel`], when the sentence being spoken is `player`'s: another player going away (the
 /// session a template preview builds and drops) leaves the reading alone.
 pub(super) fn cancel_for(player: &Arc<Player>) {
-    if CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| same_player(&c.player, player))) {
+    if may_cancel(owner().as_ref(), player, false) {
         cancel();
     }
 }
 
-/// The browser's voices.
-fn browser_voices(synth: &SpeechSynthesis) -> Vec<SpeechSynthesisVoice> {
-    synth.get_voices().iter().filter_map(|v| v.dyn_into::<SpeechSynthesisVoice>().ok()).collect()
+/// The browser's voices as Read Aloud lists them (the id is the voice URI), and how long ago they
+/// were first asked for (ms). The list is kept until the browser says it changed
+/// (`voiceschanged`); an empty one is asked for again after a second.
+pub(super) fn voices() -> (Arc<[Voice]>, f64) {
+    let now = js_sys::Date::now();
+    let first = FIRST_ASKED.with(|f| *f.borrow_mut().get_or_insert(now));
+    let fresh =
+        VOICES.with(|v| v.borrow().as_ref().filter(|v| !v.listed.is_empty() || now - v.asked < EMPTY_VOICES_AGAIN_MS).map(|v| Arc::clone(&v.listed)));
+    if let Some(listed) = fresh {
+        return (listed, now - first);
+    }
+    let Some(synth) = synth() else { return (Arc::new([]), now - first) };
+    listen_for_voices(&synth);
+    let browser: Vec<SpeechSynthesisVoice> = synth.get_voices().iter().filter_map(|v| v.dyn_into::<SpeechSynthesisVoice>().ok()).collect();
+    let listed: Arc<[Voice]> =
+        browser.iter().map(|v| Voice { id: v.voice_uri(), name: v.name(), lang: v.lang(), kind: VoiceKind::Web }).collect::<Vec<_>>().into();
+    VOICES.with(|v| *v.borrow_mut() = Some(Voices { listed: Arc::clone(&listed), browser, asked: now }));
+    (listed, now - first)
 }
 
-/// A browser voice as Read Aloud lists it (the id is the voice URI).
-fn to_voice(v: &SpeechSynthesisVoice) -> Voice {
-    Voice { id: v.voice_uri(), name: v.name(), lang: v.lang(), kind: VoiceKind::Web }
+/// Forget the voice list when the browser's changes (online voices arrive late).
+fn listen_for_voices(synth: &SpeechSynthesis) {
+    VOICES_CHANGED.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.is_none() {
+            let f: Closure<dyn FnMut()> = Closure::new(|| VOICES.with(|v| *v.borrow_mut() = None));
+            synth.set_onvoiceschanged(Some(f.as_ref().unchecked_ref()));
+            *l = Some(f);
+        }
+    });
 }
 
-/// The browser's voices as Read Aloud lists them.
-pub(super) fn voices() -> Vec<Voice> {
-    synth().map(|s| browser_voices(&s)).unwrap_or_default().iter().map(to_voice).collect()
+/// The voice `id` from the list, with the browser's own object for it.
+fn voice(id: &str) -> Option<(Voice, SpeechSynthesisVoice)> {
+    let _ = voices();
+    VOICES.with(|v| {
+        let v = v.borrow();
+        let v = v.as_ref()?;
+        let at = v.listed.iter().position(|l| l.id == id)?;
+        Some((v.listed.get(at)?.clone(), v.browser.get(at)?.clone()))
+    })
 }
 
 /// Stop with `error`.
@@ -93,10 +190,35 @@ pub(super) fn sync(shared: &Arc<Player>) {
     speak(shared, WebAttempt::default());
 }
 
-/// Cancel what is being spoken, and speak the current sentence if playing, as `attempt` says.
+/// Cancel what is being spoken and speak the current sentence as `attempt` says, if `shared` is
+/// playing; a player that isn't only stops its own sentence. After a cancel the sentence is
+/// spoken from a timer, once the browser has handled the cancel.
 fn speak(shared: &Arc<Player>, attempt: WebAttempt) {
-    cancel();
-    let (text, lang, voice, rate, generation, index) = {
+    let playing = lock(&shared.0).state == State::Playing;
+    if !may_cancel(owner().as_ref(), shared, playing) {
+        return;
+    }
+    if !cancel() {
+        return speak_now(shared, attempt);
+    }
+    let player = Arc::downgrade(shared);
+    let later = after(0.0, move || {
+        if let Some(p) = player.upgrade() {
+            if let Some((id, t)) = DEFERRED.with(|d| d.borrow_mut().take()) {
+                retire_timer(id, t);
+            }
+            speak_now(&p, attempt);
+        }
+    });
+    match later {
+        Some(later) => DEFERRED.with(|d| *d.borrow_mut() = Some(later)),
+        None => speak_now(shared, attempt),
+    }
+}
+
+/// Speak the current sentence as `attempt` says, if playing.
+fn speak_now(shared: &Arc<Player>, attempt: WebAttempt) {
+    let (text, lang, voice_id, rate, generation, index) = {
         let s = lock(&shared.0);
         if s.state != State::Playing {
             return;
@@ -114,20 +236,46 @@ fn speak(shared: &Arc<Player>, attempt: WebAttempt) {
             tailored = true;
         }
         // The chosen voice when it suits the sentence; else the browser picks one for the language.
-        if let Some(bv) = voice.as_deref().and_then(|id| browser_voices(&synth).into_iter().find(|bv| bv.voice_uri() == id))
-            && voice_for(Some(&to_voice(&bv)), lang.as_deref(), &text).is_some()
+        if let Some((v, bv)) = voice_id.as_deref().and_then(voice)
+            && voice_for(Some(&v), lang.as_deref(), &text).is_some()
         {
             u.set_voice(Some(&bv));
             tailored = true;
         }
     }
     u.set_rate(rate);
-    let sh = Arc::clone(shared);
-    let handler: Handler = Closure::new(move |e: web_sys::Event| ended(&sh, generation, index, attempt, tailored, &e));
+    let player = Arc::downgrade(shared);
+    let handler: Handler = Closure::new(move |e: web_sys::Event| {
+        if let Some(p) = player.upgrade() {
+            ended(&p, generation, index, attempt, tailored, &e);
+        }
+    });
     u.set_onend(Some(handler.as_ref().unchecked_ref()));
     u.set_onerror(Some(handler.as_ref().unchecked_ref()));
+    // A browser that never reports the end stops reading after a while, instead of hanging.
+    let player = Arc::downgrade(shared);
+    let watchdog = after(web_sentence_limit_ms(text.chars().count(), rate), move || {
+        if let Some(p) = player.upgrade() {
+            gave_up(&p, generation, index);
+        }
+    });
+    // Recorded before `speak`: a browser may report an error at once, from inside `speak`, and
+    // the next sentence must find this one to replace.
+    CURRENT.with(|c| *c.borrow_mut() = Some(Current { utterance: u.clone(), handler, player: Arc::downgrade(shared), watchdog }));
     synth.speak(&u);
-    CURRENT.with(|c| *c.borrow_mut() = Some(Current { utterance: u, handler, player: Arc::downgrade(shared) }));
+}
+
+/// The browser never reported the end of sentence `index` of `generation`.
+fn gave_up(shared: &Arc<Player>, generation: u64, index: usize) {
+    {
+        let mut s = lock(&shared.0);
+        if s.generation != generation || s.index != index || s.state != State::Playing {
+            return;
+        }
+        s.state = State::Stopped;
+        s.error = Some("The browser stopped reading aloud without finishing the sentence".into());
+    }
+    cancel();
 }
 
 /// The utterance for sentence `index` of `generation`, spoken as `attempt` says, ended (`end`)
