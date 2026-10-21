@@ -42,7 +42,9 @@ const UNSUPPORTED: &[&str] = &[
     "COMPLEXPREFIXES",
     "COMPOUNDBEGIN",
     "COMPOUNDEND",
+    "COMPOUNDFIRST",
     "COMPOUNDFLAG",
+    "COMPOUNDLAST",
     "COMPOUNDMIDDLE",
     "COMPOUNDMIN",
     "COMPOUNDPERMITFLAG",
@@ -1389,6 +1391,30 @@ pub(crate) mod tests {
         assert!(d.check("Kot") && d.check("KOTS"), "other stems still follow the sentence and heading case");
         let back = AffixDict::from_bytes(&d.to_bytes()).unwrap();
         assert!(back.check("km") && !back.check("Km"));
+    }
+
+    #[test]
+    fn morphology_only_flags_leave_words_correct() {
+        // `SUBSTANDARD` and `LEMMA_PRESENT` only steer morphological generation: the stems and
+        // rules they mark are still correct.
+        let aff = "SET UTF-8\nSUBSTANDARD x\nLEMMA_PRESENT l\nSFX a Y 2\nSFX a 0 y .\nSFX a 0 em/x .\n";
+        let d = AffixDict::from_hunspell(aff, "2\nkot/a\npies/axl\n", &[]).unwrap();
+        assert!(d.check("kot") && d.check("koty") && d.check("kotem"));
+        assert!(d.check("pies") && d.check("piesy") && d.check("piesem"));
+    }
+
+    #[test]
+    fn unsupported_directives_are_refused_and_the_rest_load() {
+        // A dictionary that needs a directive outside this engine fails to load rather than
+        // accepting the wrong words.
+        for dir in UNSUPPORTED {
+            assert!(AffixDict::from_hunspell(&format!("SET UTF-8\n{dir} X\n"), DIC, &[]).is_err(), "{dir} should be refused");
+        }
+        // The directives this engine reads, with no other change to the dictionary.
+        for line in ["AF 1\nAF ab", "AM 1\nAM po:noun", "ICONV 1\nICONV ﬁ fi", "IGNORE ()", "KEEPCASE k", "SUBSTANDARD x", "LEMMA_PRESENT l"] {
+            let d = AffixDict::from_hunspell(&format!("{AFF}{line}\n"), DIC, &[]).unwrap_or_else(|e| panic!("{line}: {e}"));
+            assert!(d.check("koty") && d.check("niekoty") && !d.check("kotx"), "{line}");
+        }
     }
 
     #[test]
