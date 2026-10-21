@@ -234,6 +234,8 @@ pub struct AffixDict {
     forbidden: Mask,
     /// Stems with NOSUGGEST are correct, but none of their forms are suggested.
     no_suggest: Mask,
+    /// Stems with SUBSTANDARD are correct too, and likewise never suggested.
+    substandard: Mask,
     /// Open-addressing hash table of stem indices (`EMPTY` = free).
     table: Vec<u32>,
     /// Flag char of each bit.
@@ -322,6 +324,7 @@ struct Rules {
     /// The `FORBIDDENWORD` flag: stems carrying it are listed but never correct.
     forbidden: Option<char>,
     no_suggest: Option<char>,
+    substandard: Option<char>,
     /// The `KEEPCASE` flag.
     keepcase: Option<char>,
     iconv: Vec<(String, String)>,
@@ -393,9 +396,10 @@ fn parse_aff(aff: &str) -> Result<Rules, String> {
         match dir {
             "SET" | "LANG" | "NAME" | "VERSION" | "HOME" | "WORDCHARS" | "MAXNGRAMSUGS" | "MAXDIFF" | "ONLYMAXDIFF" | "NOSPLITSUGS"
             | "SUGSWITHDOTS" | "WARN" | "FORBIDWARN" | "MAXCPDSUGS" => {}
-            // Morphological aliases, and flags that only matter for morphological generation
-            // and suggestions: the words they mark are correct.
-            "AM" | "SUBSTANDARD" | "LEMMA_PRESENT" => {}
+            // Morphological aliases, and a flag that only matters for morphological generation:
+            // the words it marks are correct.
+            "AM" | "LEMMA_PRESENT" => {}
+            "SUBSTANDARD" => r.substandard = Some(one_flag(at(1), dir, n)?),
             "AF" => {
                 if !af_header && f.len() == 2 && at(1).parse::<usize>().is_ok() {
                     af_header = true;
@@ -549,6 +553,7 @@ impl AffixDict {
             flag_chars: flag_chars.clone(),
             forbidden,
             no_suggest: rules.no_suggest.map_or(Mask::EMPTY, bit_of),
+            substandard: rules.substandard.map_or(Mask::EMPTY, bit_of),
             keepcase,
             iconv: rules.iconv,
             ignore: rules.ignore.into_boxed_slice(),
@@ -743,9 +748,10 @@ impl AffixDict {
         self.contains_except(&self.normalize(w), Mask::EMPTY)
     }
 
-    /// Exactly spelled dictionary words eligible for suggestions (NOSUGGEST stems excluded).
+    /// Exactly spelled dictionary words eligible for suggestions (NOSUGGEST and SUBSTANDARD
+    /// stems excluded).
     pub fn contains_suggestible(&self, w: &str) -> bool {
-        self.contains_except(&self.normalize(w), self.no_suggest)
+        self.contains_except(&self.normalize(w), self.no_suggest | self.substandard)
     }
 
     /// `w` after the `ICONV` conversions (at each position the longest match wins) and without
@@ -851,7 +857,7 @@ impl AffixDict {
 
     /// Whether a suggestion is correct in its displayed case and has an eligible stem.
     pub fn can_suggest(&self, w: &str) -> bool {
-        self.check_except(w, self.no_suggest)
+        self.check_except(w, self.no_suggest | self.substandard)
     }
 
     fn check_except(&self, w: &str, deny: Mask) -> bool {
@@ -979,7 +985,9 @@ impl AffixDict {
         for (a, b) in &self.rep {
             out.push_str(&format!("REP {} {}\n", a.replace(' ', "_"), b.replace(' ', "_")));
         }
-        for (directive, mask) in [("FORBIDDENWORD", self.forbidden), ("NOSUGGEST", self.no_suggest), ("KEEPCASE", self.keepcase)] {
+        for (directive, mask) in
+            [("FORBIDDENWORD", self.forbidden), ("NOSUGGEST", self.no_suggest), ("SUBSTANDARD", self.substandard), ("KEEPCASE", self.keepcase)]
+        {
             if !mask.is_empty()
                 && let Some(c) = self.flag_char(mask)
             {
@@ -1048,11 +1056,12 @@ impl AffixDict {
             match at(0) {
                 "TRY" => rules.try_chars = at(1).to_string(),
                 "KEY" => rules.key = at(1).to_string(),
-                directive @ ("FORBIDDENWORD" | "NOSUGGEST" | "KEEPCASE") => {
+                directive @ ("FORBIDDENWORD" | "NOSUGGEST" | "SUBSTANDARD" | "KEEPCASE") => {
                     let c = one_flag(at(1), directive, 0).map_err(|_| format!("affix dictionary: bad {directive} in `{line}`"))?;
                     match directive {
                         "FORBIDDENWORD" => rules.forbidden = Some(c),
                         "NOSUGGEST" => rules.no_suggest = Some(c),
+                        "SUBSTANDARD" => rules.substandard = Some(c),
                         _ => rules.keepcase = Some(c),
                     }
                 }
@@ -1394,13 +1403,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn morphology_only_flags_leave_words_correct() {
-        // `SUBSTANDARD` and `LEMMA_PRESENT` only steer morphological generation: the stems and
-        // rules they mark are still correct.
+    fn substandard_and_lemma_present_words_are_correct() {
+        // `SUBSTANDARD` and `LEMMA_PRESENT` steer morphological generation, and a SUBSTANDARD
+        // stem is never suggested; the stems and rules they mark are still correct.
         let aff = "SET UTF-8\nSUBSTANDARD x\nLEMMA_PRESENT l\nSFX a Y 2\nSFX a 0 y .\nSFX a 0 em/x .\n";
         let d = AffixDict::from_hunspell(aff, "2\nkot/a\npies/axl\n", &[]).unwrap();
-        assert!(d.check("kot") && d.check("koty") && d.check("kotem"));
-        assert!(d.check("pies") && d.check("piesy") && d.check("piesem"));
+        for dict in [&d, &AffixDict::from_bytes(&d.to_bytes()).unwrap()] {
+            assert!(dict.check("kot") && dict.check("koty") && dict.check("kotem"));
+            assert!(dict.check("pies") && dict.check("piesy") && dict.check("Piesem"));
+            assert!(dict.can_suggest("koty") && dict.can_suggest("kotem") && dict.contains_suggestible("kot"));
+            assert!(!dict.can_suggest("piesy") && !dict.can_suggest("Pies") && !dict.contains_suggestible("pies"));
+        }
     }
 
     #[test]
