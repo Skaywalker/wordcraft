@@ -6,9 +6,9 @@
 //! document must never send commands), and stopping cancels only WordCraft's own speech
 //! (`CANCEL self`), where `spd-say -C` would silence every client, a screen reader included.
 //!
-//! One connection speaks one sentence: it names the client, asks for the end and cancel events,
-//! sets the rate and language, sends the text, and waits for the sentence's end event. A sentence
-//! another client's message cancels (a screen reader's urgent one) is sent again, so it isn't lost.
+//! One connection speaks one sentence: it names the client, asks for the end, cancel and pause
+//! events, sets the rate and language, sends the text, and waits for the sentence's end event. A
+//! sentence another client cancels or pauses halts reading on it ([`Outcome::Halted`]).
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -22,12 +22,16 @@ const POLL: Duration = Duration::from_millis(30);
 const REPLY_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(5) };
 /// Longest reply line kept (a server sends short lines; this bounds a broken one).
 const MAX_LINE: usize = 4096;
-/// How often a sentence another client cancelled is sent again before reading moves on.
-const MAX_RESENDS: usize = 2;
 /// Speech Dispatcher's TCP port when `SPEECHD_ADDRESS` names none.
 const DEFAULT_PORT: u16 = 6560;
-/// How long a freshly started server gets to open its socket.
-const START_WAIT: Duration = Duration::from_secs(1);
+/// How long a freshly started server gets to open its socket (it loads its speech modules first).
+const START_WAIT: Duration = Duration::from_secs(5);
+/// Longest wait for a TCP connection to one address.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// The end of a sentence is awaited this long, plus [`SENTENCE_PER_CHAR`] for each character: far
+/// more than the slowest reading takes, so only a stuck server or a paused one reaches it.
+const SENTENCE_BASE: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(30) };
+const SENTENCE_PER_CHAR: Duration = Duration::from_millis(400);
 
 /// What to say and how.
 pub(super) struct Request<'a> {
@@ -41,10 +45,14 @@ pub(super) struct Request<'a> {
 /// How a sentence ended.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Outcome {
-    /// Spoken to the end (or cancelled by other clients every time it was sent).
+    /// Spoken to the end.
     Done,
     /// Reading moved on: the sentence was cancelled.
     Interrupted,
+    /// Another client cancelled or paused it: a screen reader's urgent message, or a stop or pause
+    /// for every client. SSIP doesn't say which, so the sentence isn't sent again (that would
+    /// override a stop and cut the other client off); reading halts on it instead.
+    Halted,
 }
 
 /// Where Speech Dispatcher listens.
@@ -141,13 +149,17 @@ impl Write for Stream {
     }
 }
 
-fn open(address: &Address) -> std::io::Result<Stream> {
+/// Connect to `address`; between the addresses a host name resolves to, give up once `changed()`.
+fn open(address: &Address, changed: &dyn Fn() -> bool) -> std::io::Result<Stream> {
     match address {
         Address::Unix(path) => UnixStream::connect(path).map(Stream::Unix),
         Address::Inet(host, port) => {
             let mut last = std::io::Error::from(ErrorKind::NotFound);
             for a in (host.as_str(), *port).to_socket_addrs()? {
-                match TcpStream::connect_timeout(&a, REPLY_TIMEOUT) {
+                if changed() {
+                    return Err(moved_on());
+                }
+                match TcpStream::connect_timeout(&a, CONNECT_TIMEOUT) {
                     Ok(s) => return Ok(Stream::Tcp(s)),
                     Err(e) => last = e,
                 }
@@ -176,8 +188,10 @@ pub(super) fn connect(changed: &dyn Fn() -> bool) -> Connection {
     let Some(address) = address(spec.as_deref(), env("XDG_RUNTIME_DIR"), env("XDG_CACHE_HOME"), env("HOME")) else {
         return if spec.is_some() { Connection::Unreachable("SPEECHD_ADDRESS isn't an address it understands".into()) } else { Connection::Missing };
     };
-    if let Ok(s) = open(&address) {
-        return Connection::Open(s);
+    match open(&address, changed) {
+        Ok(s) => return Connection::Open(s),
+        Err(e) if e.kind() == ErrorKind::Interrupted => return Connection::Interrupted,
+        Err(_) => {}
     }
     let mut start = std::process::Command::new("speech-dispatcher");
     start.arg("--spawn");
@@ -207,7 +221,7 @@ pub(super) fn connect(changed: &dyn Fn() -> bool) -> Connection {
         if changed() {
             return Connection::Interrupted;
         }
-        if let Ok(s) = open(&address) {
+        if let Ok(s) = open(&address, changed) {
             return Connection::Open(s);
         }
         if Instant::now() >= until {
@@ -237,24 +251,33 @@ impl<R: Read> Lines<R> {
         Lines { reader, pending: Vec::new() }
     }
 
-    /// The next complete line without its line ending, `Ok(None)` when the read timed out.
+    /// The next complete line without its line ending, or `Ok(None)` when none is complete after
+    /// one read (a timeout, or part of a line): the caller looks at its deadline and whether reading
+    /// moved on between calls, however slowly the bytes trickle in.
     fn next(&mut self) -> std::io::Result<Option<String>> {
-        loop {
-            if let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = self.pending.drain(..=end).collect();
-                return Ok(Some(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string()));
-            }
-            if self.pending.len() > MAX_LINE {
-                return Err(ErrorKind::InvalidData.into());
-            }
-            let mut buf = [0u8; 512];
-            match self.reader.read(&mut buf) {
-                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
-                Ok(n) => self.pending.extend_from_slice(buf.get(..n).unwrap_or_default()),
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => return Ok(None),
-                Err(e) => return Err(e),
-            }
+        if let Some(line) = self.complete_line() {
+            return Ok(Some(line));
         }
+        if self.pending.len() > MAX_LINE {
+            return Err(ErrorKind::InvalidData.into());
+        }
+        let mut buf = [0u8; 512];
+        match self.reader.read(&mut buf) {
+            Ok(0) => Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                self.pending.extend_from_slice(buf.get(..n).unwrap_or_default());
+                Ok(self.complete_line())
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The first complete line in `pending`, taken out of it.
+    fn complete_line(&mut self) -> Option<String> {
+        let end = self.pending.iter().position(|&b| b == b'\n')?;
+        let line: Vec<u8> = self.pending.drain(..=end).collect();
+        Some(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string())
     }
 }
 
@@ -275,22 +298,23 @@ fn moved_on() -> std::io::Error {
     std::io::Error::new(ErrorKind::Interrupted, "reading moved on")
 }
 
-/// The end (702) and cancel (703) events.
+/// The end (702), cancel (703) and pause (704) events.
 const END: u16 = 702;
 const CANCEL: u16 = 703;
+const PAUSE: u16 = 704;
 
 /// One conversation with the server.
 struct Conversation<'a, W, R> {
     w: W,
     lines: Lines<R>,
-    /// The last end or cancel event, until it's taken.
+    /// The last end, cancel or pause event, until it's taken.
     event: Option<u16>,
     /// Whether reading moved on (checked between lines and at every read timeout).
     changed: &'a dyn Fn() -> bool,
 }
 
 impl<W: Write, R: Read> Conversation<'_, W, R> {
-    /// The reply to the command just sent: its final code. An end or cancel event that arrives
+    /// The reply to the command just sent: its final code. An end, cancel or pause event that arrives
     /// meanwhile is kept. Gives up after [`REPLY_TIMEOUT`], also when the server keeps sending
     /// other lines, and as soon as reading moves on.
     fn reply(&mut self) -> std::io::Result<u16> {
@@ -298,7 +322,7 @@ impl<W: Write, R: Read> Conversation<'_, W, R> {
         loop {
             if let Some(line) = self.lines.next()? {
                 match final_code(&line) {
-                    Some(code @ (END | CANCEL)) => self.event = Some(code),
+                    Some(code @ (END | CANCEL | PAUSE)) => self.event = Some(code),
                     Some(code) if (700..800).contains(&code) => {}
                     Some(code) => return Ok(code),
                     None => {}
@@ -320,9 +344,10 @@ impl<W: Write, R: Read> Conversation<'_, W, R> {
         self.reply()
     }
 
-    /// The end or cancel event of the message just queued (no time limit: a sentence takes as
-    /// long as it takes), or an error as soon as reading moves on.
-    fn event(&mut self) -> std::io::Result<u16> {
+    /// The end, cancel or pause event of the message just queued, waited for until `limit` has
+    /// passed (a stuck server), or an error as soon as reading moves on.
+    fn event(&mut self, limit: Duration) -> std::io::Result<u16> {
+        let start = Instant::now();
         loop {
             if let Some(e) = self.event.take() {
                 return Ok(e);
@@ -330,52 +355,57 @@ impl<W: Write, R: Read> Conversation<'_, W, R> {
             if (self.changed)() {
                 return Err(moved_on());
             }
+            if start.elapsed() > limit {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "the sentence didn't end"));
+            }
             if let Some(line) = self.lines.next()?
-                && let Some(code @ (END | CANCEL)) = final_code(&line)
+                && let Some(code @ (END | CANCEL | PAUSE)) = final_code(&line)
             {
                 self.event = Some(code);
             }
         }
     }
 
-    /// Set up the client, say the sentence, and wait for it to end. A cancel event that isn't
-    /// ours (only [`converse`] cancels, and then it stops waiting) means another client's message
-    /// pushed the sentence out, a screen reader's urgent one for instance: the sentence is sent
-    /// again, and the server says it once that message is over.
-    fn speak(&mut self, req: &Request<'_>) -> std::io::Result<()> {
+    /// Set up the client, say the sentence, and wait for it to end. Only [`converse`] cancels our
+    /// own speech, and it stops waiting first, so a cancel or pause event comes from another client.
+    fn speak(&mut self, req: &Request<'_>) -> std::io::Result<Outcome> {
         ok(self.command("SET SELF CLIENT_NAME user:wordcraft:read-aloud")?)?;
         ok(self.command("SET SELF NOTIFICATION END on")?)?;
         ok(self.command("SET SELF NOTIFICATION CANCEL on")?)?;
+        ok(self.command("SET SELF NOTIFICATION PAUSE on")?)?;
         ok(self.command(&format!("SET SELF RATE {}", req.rate))?)?;
-        // A language the server doesn't know leaves its default: no error.
+        // A language the server doesn't know leaves its default: no error. The tag is checked
+        // again here, at the edge of the protocol: it goes on a command line.
         if let Some(lang) = req.lang.and_then(super::plain_tag) {
             self.command(&format!("SET SELF LANGUAGE {lang}"))?;
         }
-        for _ in 0..=MAX_RESENDS {
-            self.event = None;
-            ok(self.command("SPEAK")?)?;
-            self.w.write_all(message_data(req.text).as_bytes())?;
-            ok(self.reply()?)?;
-            if self.event()? == END {
-                break;
-            }
-        }
-        Ok(())
+        self.event = None;
+        ok(self.command("SPEAK")?)?;
+        self.w.write_all(message_data(req.text).as_bytes())?;
+        ok(self.reply()?)?;
+        let chars = u32::try_from(req.text.chars().count()).unwrap_or(u32::MAX);
+        let limit = SENTENCE_BASE.saturating_add(SENTENCE_PER_CHAR.saturating_mul(chars));
+        Ok(if self.event(limit)? == END { Outcome::Done } else { Outcome::Halted })
     }
 }
+
+/// The last words after a sentence that didn't finish.
+const CLOSE: &[u8] = b"\r\n.\r\nCANCEL self\r\nQUIT\r\n";
 
 /// Speak `req` over `stream`, cancelling it when `changed()`.
 pub(super) fn converse(stream: &Stream, req: &Request<'_>, changed: &dyn Fn() -> bool) -> std::io::Result<Outcome> {
     stream.set_timeouts()?;
     let mut c = Conversation { w: stream.try_clone()?, lines: Lines::new(stream.try_clone()?), event: None, changed };
     let result = c.speak(req);
-    let interrupted = matches!(&result, Err(e) if e.kind() == ErrorKind::Interrupted);
     // The last words wait for no answer: a server that stopped answering mustn't hold up Stop.
-    let _ = c.w.write_all(if interrupted { b"CANCEL self\r\nQUIT\r\n" } else { b"QUIT\r\n" });
+    // After anything but a finished sentence our message may still be queued, or the server may
+    // be reading message data: an empty line and `.` end a message being sent (outside one they
+    // are two refused commands), and `CANCEL self` drops ours.
+    let done = matches!(result, Ok(Outcome::Done));
+    let _ = c.w.write_all(if done { b"QUIT\r\n" } else { CLOSE });
     match result {
-        Ok(()) => Ok(Outcome::Done),
-        Err(_) if interrupted => Ok(Outcome::Interrupted),
-        Err(e) => Err(e),
+        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(Outcome::Interrupted),
+        r => r,
     }
 }
 
@@ -444,7 +474,8 @@ mod tests {
     fn a_character_split_by_a_read_timeout_stays_whole() {
         // `é` is C3 A9; the read times out (the empty read) between its two bytes.
         let mut lines = Lines::new(Reads(vec![b"249-Caf\xC3".to_vec(), Vec::new(), b"\xA9\tfr\tnone\r\n702 END\r\n".to_vec()].into()));
-        assert_eq!(lines.next().unwrap(), None);
+        assert_eq!(lines.next().unwrap(), None, "half a line");
+        assert_eq!(lines.next().unwrap(), None, "the timeout");
         assert_eq!(lines.next().unwrap().as_deref(), Some("249-Café\tfr\tnone"));
         assert_eq!(lines.next().unwrap().as_deref(), Some("702 END"));
         assert_eq!(lines.next().unwrap(), None);
@@ -454,8 +485,29 @@ mod tests {
     fn a_line_without_an_end_is_an_error_not_a_growing_buffer() {
         // A peer that never stops sending and never ends the line.
         let mut lines = Lines::new(std::io::repeat(b'x'));
-        assert_eq!(lines.next().unwrap_err().kind(), ErrorKind::InvalidData);
+        let mut calls = 0;
+        let err = loop {
+            calls += 1;
+            assert!(calls < 100, "never gave up");
+            match lines.next() {
+                Ok(None) => {}
+                Ok(Some(l)) => panic!("{l}"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(lines.pending.len() <= MAX_LINE + 512);
+    }
+
+    #[test]
+    fn a_trickle_of_bytes_hands_control_back_after_each_read() {
+        // One byte per read and never a line end: every call returns, so the caller can look at
+        // its deadline and at whether reading moved on.
+        let mut lines = Lines::new(Reads(vec![b"2".to_vec(), b"0".to_vec(), b"0".to_vec(), b" OK\r\n".to_vec()].into()));
+        assert_eq!(lines.next().unwrap(), None);
+        assert_eq!(lines.next().unwrap(), None);
+        assert_eq!(lines.next().unwrap(), None);
+        assert_eq!(lines.next().unwrap().as_deref(), Some("200 OK"));
     }
 
     /// How the stand-in server ends a message.
@@ -465,8 +517,10 @@ mod tests {
         End,
         /// Nothing until `CANCEL self`.
         Hold,
-        /// Cancelled by another client the first `n` times, then the end event.
-        CancelledBy(usize),
+        /// Cancelled by another client.
+        CancelledByOther,
+        /// Paused by another client (`PAUSE all`).
+        PausedByOther,
     }
 
     /// A Speech Dispatcher stand-in: answers every command with `2xx` and ends each message as
@@ -476,7 +530,6 @@ mod tests {
             let mut got = Vec::new();
             let mut r = BufReader::new(s.try_clone().unwrap());
             let mut in_data = false;
-            let mut messages = 0;
             loop {
                 let mut line = String::new();
                 if r.read_line(&mut line).unwrap_or(0) == 0 {
@@ -489,12 +542,10 @@ mod tests {
                         continue;
                     }
                     in_data = false;
-                    messages += 1;
                     match ending {
-                        Ending::CancelledBy(n) if messages <= n => {
-                            b"225-1\r\n225 OK MESSAGE QUEUED\r\n701 BEGIN\r\n703-1\r\n703-7\r\n703 CANCELED\r\n"
-                        }
-                        Ending::End | Ending::CancelledBy(_) => b"225-1\r\n225 OK MESSAGE QUEUED\r\n702-1\r\n702-7\r\n702 END\r\n",
+                        Ending::CancelledByOther => b"225-1\r\n225 OK MESSAGE QUEUED\r\n701 BEGIN\r\n703-1\r\n703-7\r\n703 CANCELED\r\n",
+                        Ending::PausedByOther => b"225-1\r\n225 OK MESSAGE QUEUED\r\n701 BEGIN\r\n704-1\r\n704-7\r\n704 PAUSED\r\n",
+                        Ending::End => b"225-1\r\n225 OK MESSAGE QUEUED\r\n702-1\r\n702-7\r\n702 END\r\n",
                         Ending::Hold => b"225-1\r\n225 OK MESSAGE QUEUED\r\n701 BEGIN\r\n",
                     }
                 } else if line == "SPEAK" {
@@ -536,19 +587,32 @@ mod tests {
     }
 
     #[test]
-    fn a_sentence_another_client_cancelled_is_said_again() {
+    fn a_sentence_another_client_cancels_or_pauses_halts_reading() {
+        // A screen reader's urgent message, `CANCEL all` or `PAUSE all` from another client: the
+        // sentence is neither skipped nor sent again over the other client's speech.
+        for ending in [Ending::CancelledByOther, Ending::PausedByOther] {
+            let (client, srv) = UnixStream::pair().unwrap();
+            let h = server(srv, ending);
+            let req = Request { text: "Interrupted by a screen reader.", rate: 0, lang: None };
+            assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap(), Outcome::Halted);
+            let got = h.join().unwrap();
+            assert_eq!(speaks(&got), 1, "{got:?}");
+            assert!(got.contains(&"SET SELF NOTIFICATION PAUSE on".to_string()), "{got:?}");
+            // Only our own (paused) message is dropped.
+            assert!(got.contains(&"CANCEL self".to_string()) && !got.iter().any(|l| l.eq_ignore_ascii_case("CANCEL all")), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn a_sentence_that_never_ends_times_out() {
+        // A stuck speech module: no end event ever. The wait is bounded by the sentence's length.
         let (client, srv) = UnixStream::pair().unwrap();
-        let h = server(srv, Ending::CancelledBy(1));
-        let req = Request { text: "Interrupted by a screen reader.", rate: 0, lang: None };
-        assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap(), Outcome::Done);
-        let got = h.join().unwrap();
-        assert_eq!(speaks(&got), 2, "{got:?}");
-        assert!(!got.iter().any(|l| l.starts_with("CANCEL")), "{got:?}");
-        // A server that cancels every time: a few tries, then reading moves on.
-        let (client, srv) = UnixStream::pair().unwrap();
-        let h = server(srv, Ending::CancelledBy(usize::MAX));
-        assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap(), Outcome::Done);
-        assert_eq!(speaks(&h.join().unwrap()), 1 + MAX_RESENDS);
+        let h = server(srv, Ending::Hold);
+        let req = Request { text: "x", rate: 0, lang: None };
+        let start = Instant::now();
+        assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap_err().kind(), ErrorKind::TimedOut);
+        assert!(start.elapsed() < SENTENCE_BASE + SENTENCE_PER_CHAR + REPLY_TIMEOUT * 2, "{:?}", start.elapsed());
+        assert!(h.join().unwrap().contains(&"CANCEL self".to_string()), "the stuck message is dropped");
     }
 
     #[test]
@@ -579,7 +643,10 @@ mod tests {
         let start = Instant::now();
         assert_eq!(converse(&Stream::Unix(client), &req, &|| true).unwrap(), Outcome::Interrupted);
         assert!(start.elapsed() < REPLY_TIMEOUT, "{:?}", start.elapsed());
-        assert!(h.join().unwrap().contains("CANCEL self"));
+        // Stopped while the server may be about to read message data: the empty line and `.` end
+        // any message first, so `CANCEL self` is never taken for text.
+        let all = h.join().unwrap();
+        assert!(all.ends_with("\r\n\r\n.\r\nCANCEL self\r\nQUIT\r\n"), "{all:?}");
     }
 
     #[test]
