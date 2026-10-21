@@ -287,6 +287,17 @@ fn speech_dispatcher_rate_follows_the_speed() {
 }
 
 #[test]
+fn speech_dispatcher_keeps_the_region() {
+    assert_eq!(dispatcher_language(Some("en-GB")), Some("en-GB"));
+    assert_eq!(dispatcher_language(Some(" pt-BR ")), Some("pt-BR"));
+    assert_eq!(dispatcher_language(Some("zh-TW")), Some("zh-TW"));
+    assert_eq!(dispatcher_language(Some("hu")), Some("hu"));
+    assert_eq!(dispatcher_language(Some("x-none")), None);
+    assert_eq!(dispatcher_language(Some("hu\r\nQUIT")), None);
+    assert_eq!(dispatcher_language(None), None);
+}
+
+#[test]
 fn english_text_keeps_the_default_voice() {
     // Word writes `en-US` on almost every run: espeak's default voice is English already, so
     // no `-v` (as before #1843), and Word's language-less `x-none` is no voice either.

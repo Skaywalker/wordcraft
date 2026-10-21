@@ -25,7 +25,7 @@ pens, microphones (Dictate) and speakers (Read Aloud), and displays.
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-18 | trivial | Linux Read Aloud: Speech Dispatcher (over its socket, with the sentence's language; stopping cancels only WordCraft's own speech) when neither espeak-ng nor espeak is installed, a message naming the program to install when none is, and a speech program recommended by the `.deb` (`espeak-ng` or `speech-dispatcher`) and `.rpm` (`espeak-ng`) packages |
+| 2026-10-18 | trivial | Linux Read Aloud: Speech Dispatcher (over its socket, at `SPEECHD_ADDRESS` or the default socket, with the sentence's language and region; stopping cancels only WordCraft's own speech, and a sentence another client's message cancels is said again) when neither espeak-ng nor espeak is installed, a message naming the program to install when none is, and a speech program recommended by the `.deb` (`espeak-ng` or `speech-dispatcher`) and `.rpm` (`espeak-ng`) packages |
 | 2026-10-15 | trivial | Pen / stylus row: Ink to Shape also makes two-stroke arrows and arrows with a closed triangle head |
 | 2026-10-17 | minor | File › Print's Scale to paper size (#2108): pick Letter, Legal, A4 or any Layout › Size paper and every page is scaled to it and centred, the paper turned to each page's orientation, in the preview, the print job (with the spooler's media) and Save these pages as PDF; the document keeps its page size. `paper` param on `ui.print`/`file.printPdf` |
 | 2026-10-14 | trivial | Pen / stylus row corrected: ink, eraser and Ink to Shape (with arrows) work; pressure and Ink to Math missing |
