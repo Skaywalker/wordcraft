@@ -753,6 +753,51 @@ ipso facto\t1
     }
 
     #[test]
+    fn first_middle_and_last_places() {
+        // `COMPOUNDFIRST` and `COMPOUNDLAST` are the older names of `COMPOUNDBEGIN` and
+        // `COMPOUNDEND`; a `COMPOUNDMIDDLE` part sits only between two others.
+        let dic = "3\nkis/B\nnagy/M\nház/E\n";
+        for (first, last) in [("COMPOUNDBEGIN", "COMPOUNDEND"), ("COMPOUNDFIRST", "COMPOUNDLAST")] {
+            let aff = format!("SET UTF-8\n{first} B\nCOMPOUNDMIDDLE M\n{last} E\n");
+            let d = AffixDict::from_hunspell(&aff, dic, &[]).unwrap();
+            assert_words(&d, &["kisház", "kisnagyház", "kisnagynagyház"], &["kisnagy", "nagyház", "házkis", "kiskis", "nagynagy"]);
+        }
+    }
+
+    #[test]
+    fn pseudoroot_is_needaffix() {
+        let aff = AFF.replace("NEEDAFFIX N", "PSEUDOROOT N");
+        let d = AffixDict::from_hunspell(&aff, DIC, &[]).unwrap();
+        assert_words(&d, &["üzelmok", "üzelmban", "baj", "bajok"], &["üzelm"]);
+    }
+
+    #[test]
+    fn syllablenum_suffixes_count_toward_the_six_three_rule() {
+        // `ban` is inflection and doesn't count, unless `SYLLABLENUM` lists its class.
+        let d = dict();
+        let counted = AffixDict::from_hunspell(&format!("{AFF}SYLLABLENUM s\n"), DIC, &[]).unwrap();
+        assert!(d.check("almatetőkulcsfaban"), "6 of 7 syllables count");
+        assert!(!counted.check("almatetőkulcsfaban"), "all 7 count");
+        assert!(counted.check("almatetőkulcsfa") && counted.check("almafaban"));
+    }
+
+    #[test]
+    fn every_compounding_directive_loads() {
+        for dir in super::DIRECTIVES {
+            let arg = match *dir {
+                "COMPOUNDMIN" | "COMPOUNDWORDMAX" => "2",
+                "COMPOUNDSYLLABLE" => "6 aeiou",
+                "CHECKCOMPOUNDPATTERN" => "ssz sz",
+                "COMPOUNDRULE" => "n*m",
+                "BREAK" => "-",
+                _ => "Y",
+            };
+            let aff = format!("SET UTF-8\n{dir} {arg}\n");
+            assert!(AffixDict::from_hunspell(&aff, "1\nalma/Y\n", &[]).is_ok(), "{dir} should load");
+        }
+    }
+
+    #[test]
     fn forbidden_words_stay_wrong() {
         let d = dict();
         assert_words(&d, &["Petőfi-ház", "PETŐFI-HÁZ", "házalma"], &["almaház", "Petőfi-híd", "PETŐFI-HÍD"]);
