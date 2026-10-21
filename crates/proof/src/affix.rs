@@ -265,6 +265,9 @@ pub struct AffixDict {
     flags: Vec<u16>,
     /// Distinct flag masks.
     sets: Vec<Mask>,
+    /// Stems listed more than once with different flags (`szán` the noun, `szán` the verb): the
+    /// flag set of each entry, by stem index. `flags` holds their union.
+    homonyms: FxMap<u32, Box<[u16]>>,
     /// The `FORBIDDENWORD` flag's bit; stems carrying it are not words (0: none declared).
     forbidden: Mask,
     /// Stems with NOSUGGEST are correct, but none of their forms are suggested.
@@ -615,9 +618,8 @@ impl AffixDict {
             // The entry ends where Hunspell ends it ([`crate::hunspell::dic_entry_end`]): at a tab
             // or the first morphological field (` po:noun`), so it may hold spaces (`ipso facto`,
             // a phrase that is never one word); with neither, at the first space.
-            let line = line.trim_start_matches(' ');
             let end = crate::hunspell::dic_entry_end(line.as_bytes());
-            let (tok, morph) = (line.get(..end).unwrap_or(line).trim_matches(' '), line.get(end..).unwrap_or("").trim());
+            let (tok, morph) = (line.get(..end).unwrap_or(line).trim_end_matches(' '), line.get(end..).unwrap_or("").trim());
             if tok.is_empty() {
                 continue;
             }
@@ -714,6 +716,7 @@ impl AffixDict {
             let Some((word, _)) = stems.get(i) else { break };
             let mut mask = Mask::EMPTY;
             let mut common = status;
+            let mut entries: Vec<Mask> = Vec::new();
             let mut j = i;
             while let Some((w, f)) = stems.get(j)
                 && w == word
@@ -721,13 +724,25 @@ impl AffixDict {
                 let m = f.chars().map(bit_of).fold(Mask::EMPTY, |a, b| a | b);
                 mask |= m;
                 common = common & m;
+                if !entries.contains(&m) {
+                    entries.push(m);
+                }
                 j += 1;
             }
             mask = (mask & !status) | common;
-            let next_id = u16::try_from(d.sets.len()).map_err(|_| "too many distinct flag sets".to_string())?;
-            let id = *set_ids.entry(mask).or_insert(next_id);
-            if usize::from(id) == d.sets.len() {
-                d.sets.push(mask);
+            let mut intern = |m: Mask| -> Result<u16, String> {
+                let next_id = u16::try_from(d.sets.len()).map_err(|_| "too many distinct flag sets".to_string())?;
+                let id = *set_ids.entry(m).or_insert(next_id);
+                if usize::from(id) == d.sets.len() {
+                    d.sets.push(m);
+                }
+                Ok(id)
+            };
+            let id = intern(mask)?;
+            if entries.len() > 1 {
+                let ids = entries.into_iter().map(&mut intern).collect::<Result<Box<[u16]>, String>>()?;
+                let at = u32::try_from(d.flags.len()).map_err(|_| "too many stems".to_string())?;
+                d.homonyms.insert(at, ids);
             }
             d.words.push_str(word);
             d.offs.push(u32::try_from(d.words.len()).map_err(|_| "stems too large".to_string())?);
@@ -857,6 +872,12 @@ impl AffixDict {
 
     /// Flag mask of a stem, if `w` is one, whatever its flags.
     fn stem_mask(&self, w: &str) -> Option<Mask> {
+        let i = self.stem_index(w)?;
+        self.flags.get(i).and_then(|&id| self.sets.get(usize::from(id))).copied()
+    }
+
+    /// The index of the stem `w`, if it is one.
+    fn stem_index(&self, w: &str) -> Option<usize> {
         if self.table.is_empty() {
             return None;
         }
@@ -868,12 +889,19 @@ impl AffixDict {
                 return None;
             }
             if self.word(t as usize) == Some(w) {
-                let id = *self.flags.get(t as usize)?;
-                return self.sets.get(usize::from(id)).copied();
+                return Some(t as usize);
             }
             slot = (slot + 1) & mask;
         }
         None
+    }
+
+    /// The flag masks of the entries of stem `i`, one per homonym, as Hunspell checks them (an
+    /// affix flag of the verb `szán` doesn't join the compound flag of the noun `szán`).
+    fn entries(&self, i: Option<usize>) -> impl Iterator<Item = Mask> + '_ {
+        let many = i.and_then(|i| self.homonyms.get(&u32::try_from(i).ok()?));
+        let one = if many.is_none() { i.and_then(|i| self.flags.get(i)).and_then(|&id| self.sets.get(usize::from(id))).copied() } else { None };
+        many.into_iter().flat_map(|ids| ids.iter()).filter_map(|&id| self.sets.get(usize::from(id)).copied()).chain(one)
     }
 
     /// Every way `w` is a stem with affixes, within Hunspell's bounds (a prefix; at most two
@@ -884,10 +912,10 @@ impl AffixDict {
         if w.is_empty() || w.len() > MAX_WORD_BYTES {
             return false;
         }
-        if let Some(stem) = self.stem_mask(w)
-            && f(&Parse { stem, prefix: None, suffixes: [None, None] })
-        {
-            return true;
+        for stem in self.entries(self.stem_index(w)) {
+            if f(&Parse { stem, prefix: None, suffixes: [None, None] }) {
+                return true;
+            }
         }
         if self.suffix_parses(w, None, f) {
             return true;
@@ -906,11 +934,10 @@ impl AffixDict {
             if !p.cond_matches(&root, false) {
                 continue;
             }
-            if let Some(stem) = self.stem_mask(&root)
-                && stem.meets(p.bit)
-                && f(&Parse { stem, prefix: Some(p), suffixes: [None, None] })
-            {
-                return true;
+            for stem in self.entries(self.stem_index(&root)) {
+                if stem.meets(p.bit) && f(&Parse { stem, prefix: Some(p), suffixes: [None, None] }) {
+                    return true;
+                }
             }
             if self.suffix_parses(&root, Some(p), f) {
                 return true;
@@ -945,14 +972,15 @@ impl AffixDict {
             if outer.is_empty() {
                 continue;
             }
-            let root_stem = self.stem_mask(&root);
-            for &r1 in &outer {
-                if let Some(stem) = root_stem
-                    && stem.meets(r1.bit)
-                    && prefix.is_none_or(|p| r1.cont.meets(p.bit) || (p.cross && r1.cross && stem.meets(p.bit)))
-                    && f(&Parse { stem, prefix, suffixes: [Some(r1), None] })
-                {
-                    return true;
+            let root_stem = self.stem_index(&root);
+            for stem in self.entries(root_stem) {
+                for &r1 in &outer {
+                    if stem.meets(r1.bit)
+                        && prefix.is_none_or(|p| r1.cont.meets(p.bit) || (p.cross && r1.cross && stem.meets(p.bit)))
+                        && f(&Parse { stem, prefix, suffixes: [Some(r1), None] })
+                    {
+                        return true;
+                    }
                 }
             }
             if prefix.is_some() {
@@ -964,14 +992,16 @@ impl AffixDict {
                 inner.clear();
                 inner.push_str(base2);
                 inner.push_str(&g2.strip);
-                let Some(stem) = self.stem_mask(&inner) else { continue };
-                for r2 in g2.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)) {
-                    if !stem.meets(r2.bit) || !r2.cond_matches(&inner, true) {
-                        continue;
-                    }
-                    for &r1 in &outer {
-                        if r2.cont.meets(r1.bit) && f(&Parse { stem, prefix: None, suffixes: [Some(r1), Some(r2)] }) {
-                            return true;
+                let Some(at) = self.stem_index(&inner) else { continue };
+                for stem in self.entries(Some(at)) {
+                    for r2 in g2.rules.iter().filter_map(|&i| self.suffixes.get(i as usize)) {
+                        if !stem.meets(r2.bit) || !r2.cond_matches(&inner, true) {
+                            continue;
+                        }
+                        for &r1 in &outer {
+                            if r2.cont.meets(r1.bit) && f(&Parse { stem, prefix: None, suffixes: [Some(r1), Some(r2)] }) {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -1002,10 +1032,17 @@ impl AffixDict {
     /// Is `w` (normalized, case as written) a word: listed and not forbidden, an affixed form,
     /// or a compound? A stem listed as `FORBIDDENWORD` is wrong however else it could be read.
     fn is_word(&self, w: &str, deny: Mask) -> bool {
+        let mut budget = compound::PART_BUDGET;
+        self.is_word_in(w, deny, &mut budget)
+    }
+
+    /// [`AffixDict::is_word`], the compound search spending `budget` (shared by every reading of
+    /// one word).
+    fn is_word_in(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
         if self.stem_mask(w).is_some_and(|m| m.meets(self.forbidden)) {
             return false;
         }
-        self.simple(w, deny) || self.compound_word(w, deny)
+        self.simple(w, deny) || self.compound_word(w, deny, budget)
     }
 
     /// Is `w` exactly (case and all) a stem, an affixed form of one or a compound? `ICONV` and
@@ -1069,12 +1106,27 @@ impl AffixDict {
 
     fn check_except(&self, w: &str, deny: Mask) -> bool {
         let w = self.normalize(w);
-        self.check_case(&w, deny) || self.breaks_ok(&break_text(&w), deny, &mut compound::Breaks::new())
+        let mut breaks = compound::Breaks::new();
+        match self.check_case(&w, deny, &mut breaks.parts) {
+            Some(found) => found,
+            None => self.breaks_ok(&break_text(&w), deny, &mut breaks),
+        }
     }
 
-    /// Is one of the [`AffixDict::case_readings`] of `w` (normalized) a word?
-    fn check_case(&self, w: &str, deny: Mask) -> bool {
-        self.case_readings(w).any(|(v, case_deny)| self.is_word(&v, deny | case_deny))
+    /// Is one of the [`AffixDict::case_readings`] of `w` (normalized) a word? `Some(false)` when
+    /// a reading met first is a listed `FORBIDDENWORD`: then the word is wrong and isn't split
+    /// either, as in Hunspell (`ijs` and `Ijs/W`: `Ijs` and `IJS` are wrong; `alma-fa/W`:
+    /// `Alma-fa` is). `None` when no reading is a word.
+    fn check_case(&self, w: &str, deny: Mask, budget: &mut u32) -> Option<bool> {
+        for (v, case_deny) in self.case_readings(w) {
+            if self.stem_mask(&v).is_some_and(|m| m.meets(self.forbidden)) {
+                return Some(false);
+            }
+            if self.is_word_in(&v, deny | case_deny, budget) {
+                return Some(true);
+            }
+        }
+        None
     }
 
     /// The readings of `w` [`AffixDict::check`] tries, with the flags each must not rely on,
@@ -1113,7 +1165,10 @@ impl AffixDict {
         if let Some(&known) = breaks.seen.get(w) {
             return known;
         }
-        let ok = self.check_case(w, deny) || self.breaks_ok(&break_text(w), deny, breaks);
+        let ok = match self.check_case(w, deny, &mut breaks.parts) {
+            Some(found) => found,
+            None => self.breaks_ok(&break_text(w), deny, breaks),
+        };
         breaks.seen.insert(w.to_string(), ok);
         ok
     }
@@ -1128,7 +1183,11 @@ impl AffixDict {
         if f.meets(self.compound.only_in) {
             return Vec::new();
         }
-        let mut out = if f.meets(self.compound.need_affix) { Vec::new() } else { vec![stem.to_string()] };
+        let c = &self.compound;
+        let mut out = if f.meets(c.need_affix) { Vec::new() } else { vec![stem.to_string()] };
+        // A form whose outer affix needs another one is no word; one through an affix that may
+        // stand only inside compounds is none either, nor anything built on it.
+        let outer_ok = |r: &Rule| !r.cont.meets(c.need_affix);
         let mut cross_sfx = Vec::new();
         // Suffix forms queued with the continuation classes they carry, for chained expansion;
         // each (form, classes) pair is expanded once.
@@ -1140,14 +1199,19 @@ impl AffixDict {
                 continue;
             }
             let Some(base) = stem.strip_suffix(&*r.strip) else { continue };
+            if r.cont.meets(c.only_in) {
+                continue;
+            }
             let form = format!("{base}{}", r.add);
-            if r.cross {
+            if r.cross && outer_ok(r) {
                 cross_sfx.push(form.clone());
             }
             if !r.cont.is_empty() && queued.insert((form.clone(), r.cont)) {
                 chain.push((form.clone(), r.cont));
             }
-            out.push(form);
+            if outer_ok(r) {
+                out.push(form);
+            }
             if out.len() >= MAX_FORMS {
                 return out;
             }
@@ -1169,11 +1233,16 @@ impl AffixDict {
                         continue;
                     }
                     let Some(base) = form.strip_suffix(&*r.strip) else { continue };
+                    if r.cont.meets(c.only_in) {
+                        continue;
+                    }
                     let next = format!("{base}{}", r.add);
                     if !r.cont.is_empty() && queued.insert((next.clone(), r.cont)) {
                         chain.push((next.clone(), r.cont));
                     }
-                    out.push(next);
+                    if outer_ok(r) {
+                        out.push(next);
+                    }
                     if out.len() >= MAX_FORMS {
                         return out;
                     }
@@ -1185,7 +1254,12 @@ impl AffixDict {
                 continue;
             }
             let Some(rest) = stem.strip_prefix(&*r.strip) else { continue };
-            out.push(format!("{}{rest}", r.add));
+            if r.cont.meets(c.only_in) {
+                continue;
+            }
+            if outer_ok(r) {
+                out.push(format!("{}{rest}", r.add));
+            }
             if r.cross {
                 for s in &cross_sfx {
                     work += 1;
@@ -1309,16 +1383,18 @@ impl AffixDict {
         for i in 0..self.len() {
             let Some(w) = self.word(i) else { continue };
             let b = w.as_bytes();
-            let p = prev.iter().zip(b).take_while(|(x, y)| x == y).count().min(255);
-            raw.push(p as u8);
-            raw.extend_from_slice(b.get(p..).unwrap_or_default());
-            let mask = self.flags.get(i).and_then(|&id| self.sets.get(usize::from(id))).copied().unwrap_or_default();
-            if !mask.is_empty() {
-                raw.push(b'/');
-                raw.extend_from_slice(self.flag_chars_for(mask).as_bytes());
+            // A homonym is a line of its own, as in the `.dic`; the next line repeats the word.
+            for mask in self.entries(Some(i)) {
+                let p = prev.iter().zip(b).take_while(|(x, y)| x == y).count().min(255);
+                raw.push(p as u8);
+                raw.extend_from_slice(b.get(p..).unwrap_or_default());
+                if !mask.is_empty() {
+                    raw.push(b'/');
+                    raw.extend_from_slice(self.flag_chars_for(mask).as_bytes());
+                }
+                raw.push(b'\n');
+                prev = b;
             }
-            raw.push(b'\n');
-            prev = b;
         }
         miniz_oxide::deflate::compress_to_vec(&raw, 10)
     }

@@ -5,15 +5,19 @@
 //!
 //! - **Compound flags.** A part needs `COMPOUNDFLAG` or the flag for its place (`COMPOUNDBEGIN`,
 //!   `COMPOUNDMIDDLE`, `COMPOUNDEND`), on the stem or on an affix's continuation classes. A
-//!   prefix may start a compound and a suffix may end it; inside, an affix needs
-//!   `COMPOUNDPERMITFLAG` or a compound flag of its own. `COMPOUNDFORBIDFLAG`, on a stem or a suffix, keeps the word out of
-//!   the first and middle places (`nárciszmetrózik` ends in one). `ONLYINCOMPOUND` stems and
-//!   affixes appear only inside compounds; parts are at least `COMPOUNDMIN` letters (default 3)
-//!   and carry at most one suffix (two with `COMPOUNDMORESUFFIXES`).
+//!   prefix may start a compound and a suffix may end it; a prefix further on needs
+//!   `COMPOUNDPERMITFLAG`, a suffix before the end that or a compound flag of its own.
+//!   `COMPOUNDFORBIDFLAG`, on a stem or a suffix, keeps the word out of the first and middle
+//!   places (`nárciszmetrózik` ends in one). `ONLYINCOMPOUND` stems and affixes appear only
+//!   inside compounds; parts are at least `COMPOUNDMIN` letters (default 3), and a part before
+//!   the last carries at most one suffix (two with `COMPOUNDMORESUFFIXES`). Homonyms (`szán` the
+//!   noun and the verb) are separate entries, as in Hunspell.
 //! - **Size.** At most `COMPOUNDWORDMAX` words (a `COMPOUNDROOT` stem, itself a compound, counts
 //!   as two). Past that a compound is still correct when it has at most the `COMPOUNDSYLLABLE`
 //!   count of syllables: Hungarian's 6–3 rule, where a compound of more than two words and more
-//!   than six syllables takes a hyphen. Syllables are the vowels `COMPOUNDSYLLABLE` lists; the
+//!   than six syllables takes a hyphen; in a Hungarian dictionary (`LANG hu_HU`) a prefix of two
+//!   syllables or more after the first part counts as a word. Syllables are the vowels
+//!   `COMPOUNDSYLLABLE` lists; the
 //!   inflections on the last part don't count. A suffix after which the word may compound again
 //!   forms a new word and counts, as do the suffix classes `SYLLABLENUM` lists. An inflected
 //!   form listed as a stem counts as its lemma (`st:` in its morphological fields: `falevelek`
@@ -26,18 +30,22 @@
 //!   `REP` misspelling of a word: `hajlak` for `haljak`). Two neighbouring parts that together
 //!   are a listed word are read as that word (`szezon` + `légzáró`, never `lég` + `záró`).
 //! - **`COMPOUNDRULE`**: patterns of flags with `*` and `?` (`0*1`: numbers such as
-//!   `1999-ben`), matched by stems, the last of which may carry suffixes.
+//!   `1999-ben`), matched by stems of at least `COMPOUNDMIN` letters, as many as the word holds,
+//!   the last of which may carry suffixes.
 //! - **`BREAK`**: strings at which a word is split and both sides checked like words, each in its
 //!   own letter case (`Petőfi-vers`, `alma-Fa`; a word in capitals is split capitalized); `^`
 //!   and `$` anchor one to the start or the end (`-féle$`). A word with ten break points or more
-//!   is wrong, as in Hunspell. Only dictionaries that declare
+//!   is wrong, and a reading that is a listed `FORBIDDENWORD` isn't split, as in Hunspell; in a
+//!   Hungarian dictionary the left side of a hyphen may be listed with it (`vegyiáru-`). Only
+//!   dictionaries that declare
 //!   `BREAK` get breaks; Hunspell's built-in default (break at hyphens) isn't applied, so the
 //!   languages that check hyphenated words themselves keep doing so.
 //!
 //! `NEEDAFFIX` stems are words only with an affix; it is read here with the other flags of this
-//! family. Searches are bounded: at most [`MAX_PARTS`] parts and [`PART_BUDGET`] part and `REP`
-//! lookups per word (a state that failed once isn't searched again), and [`BREAK_BUDGET`] checks
-//! for the breaks of one word, each side checked once.
+//! family. Searches are bounded: at most [`MAX_PARTS`] parts (`COMPOUNDRULE`: the word's length)
+//! and [`PART_BUDGET`] part and `REP` lookups per checked word, shared by its case readings and
+//! break sides (a state that failed once isn't searched again), and [`BREAK_BUDGET`] checks for
+//! the breaks of one word, each side checked once.
 
 use super::{AffixDict, Mask, Parse, Rule};
 
@@ -83,15 +91,17 @@ pub(super) const BREAK_BUDGET: u32 = 64;
 /// hyphens).
 const MAX_BREAK_POINTS: usize = 10;
 
-/// The break checks of one word: the budget left and the sides already checked.
+/// The checks of one word: the break budget left, the sides already checked, and the part
+/// budget every compound search of the word shares (its case readings and break sides).
 pub(super) struct Breaks {
     budget: u32,
+    pub(super) parts: u32,
     pub(super) seen: crate::patterns::FxMap<String, bool>,
 }
 
 impl Breaks {
     pub(super) fn new() -> Breaks {
-        Breaks { budget: BREAK_BUDGET, seen: crate::patterns::FxMap::default() }
+        Breaks { budget: BREAK_BUDGET, parts: PART_BUDGET, seen: crate::patterns::FxMap::default() }
     }
 }
 
@@ -339,6 +349,8 @@ struct Part {
     /// How many words it counts as (2 for a `COMPOUNDROOT` stem).
     words: usize,
     stem: Mask,
+    /// No suffix: the stem ends where the part does (`CHECKCOMPOUNDPATTERN 0`).
+    suffixless: bool,
     /// Syllables of its suffixes that don't count toward the 6–3 rule.
     uncounted: usize,
 }
@@ -359,7 +371,7 @@ struct Search<'w> {
 
 impl AffixDict {
     /// Is `w` (normalized, case as written) a compound word?
-    pub(super) fn compound_word(&self, w: &str, deny: Mask) -> bool {
+    pub(super) fn compound_word(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
         let c = &self.compound;
         if (!c.enabled() && c.rules.is_empty()) || w.len() > super::MAX_WORD_BYTES {
             return false;
@@ -368,8 +380,13 @@ impl AffixDict {
         if bounds.len() < 3 {
             return false;
         }
-        let mut s = Search { w, bounds, parts: Default::default(), failed: Default::default(), budget: PART_BUDGET, deny };
-        (c.enabled() && self.compound_from(&mut s, 0, 0, None)) || c.rules.iter().any(|r| self.rule_from(&mut s, r, 0, 0, 0))
+        if *budget == 0 {
+            return false;
+        }
+        let mut s = Search { w, bounds, parts: Default::default(), failed: Default::default(), budget: *budget, deny };
+        let found = (c.enabled() && self.compound_from(&mut s, 0, 0, None)) || c.rules.iter().any(|r| self.rule_from(&mut s, r, 0, 0, 0));
+        *budget = s.budget;
+        found
     }
 
     /// Can `s.w` from boundary `start` on be the rest of a compound that has `words` words so
@@ -447,10 +464,13 @@ impl AffixDict {
             if !self.part_ok(p, place, deny) {
                 return false;
             }
-            let words = if p.stem.meets(c.root) { 2 } else { 1 };
+            // In a Hungarian dictionary a prefix of more than one syllable after the first part
+            // counts as a word of its own, as in Hunspell (`kerekasztal` + `elő` + `döntőbíró`).
+            let long_prefix = c.hungarian && place != Place::First && p.prefix.is_some_and(|r| self.syllables(&r.add) > 1);
+            let words = if p.stem.meets(c.root) { 2 } else { 1 } + usize::from(long_prefix);
             let uncounted = if place == Place::Last { self.uncounted_syllables(p) } else { 0 };
             if best.is_none_or(|q| (words, std::cmp::Reverse(uncounted)) < (q.words, std::cmp::Reverse(q.uncounted))) {
-                best = Some(Part { words, stem: p.stem, uncounted });
+                best = Some(Part { words, stem: p.stem, suffixless: p.suffixes[0].is_none(), uncounted });
             }
             // The last part may yet have a reading with more uncounted inflection.
             words == 1 && place != Place::Last
@@ -468,7 +488,9 @@ impl AffixDict {
         if !p.affixed() && p.stem.meets(c.need_affix) || p.outer_cont().meets(c.need_affix) {
             return false;
         }
-        if p.suffixes[1].is_some() && !c.more_suffixes {
+        // Two suffixes in a row need `COMPOUNDMORESUFFIXES`, except on the last part, which
+        // Hunspell checks like a word (`alma` + `váró` + `ban`).
+        if place != Place::Last && p.suffixes[1].is_some() && !c.more_suffixes {
             return false;
         }
         let roles = p.stem | p.conts();
@@ -483,17 +505,16 @@ impl AffixDict {
         if place != Place::Last && (p.stem.meets(c.forbid) || p.suffix_rules().any(|r| r.cont.meets(c.forbid))) {
             return false;
         }
-        // Inside a compound an affix needs `COMPOUNDPERMITFLAG`, unless it carries the compound
-        // flag itself (`kedvez` + `ő` → `kedvezőpocak`). In a Hungarian dictionary a prefix after
-        // the first part needs the compound flag too. This isn't Hunspell's own rule (a small
-        // dictionary with a permitted prefix compounds after a noun, with `LANG hu_HU` or
-        // without), but it reads the Hungarian dictionary closer to Hunspell than the permit flag
-        // does: that one puts the permit flag on its verb prefixes, yet Hunspell rejects
-        // `előanyag` + `elszánt` (and accepts `kozmodróm` + `kiélezett`, which this misses).
+        // Inside a compound a suffix needs `COMPOUNDPERMITFLAG`, unless it carries the compound
+        // flag itself (`kedvez` + `ő` → `kedvezőpocak`); a prefix after the first part needs the
+        // permit flag, as in Hunspell (`anyag` + `ki/Y` `szánt` is wrong, `anyag` + `be/P` `szánt`
+        // is right). Homonyms are separate parses, so the prefix flag of the verb `szán` doesn't
+        // join the compound flag of the noun `szán` (`előanyag` + `elszánt` is wrong).
         let inside = c.permit | c.flag | at_place;
-        if c.hungarian && place != Place::First && p.prefix.is_some_and(|r| !r.cont.meets(c.flag | at_place)) {
+        if place != Place::First && p.prefix.is_some_and(|r| !r.cont.meets(c.permit)) {
             return false;
         }
+
         !(place != Place::Last && p.suffix_rules().any(|r: &Rule| !r.cont.meets(inside)))
     }
 
@@ -521,11 +542,11 @@ impl AffixDict {
         }
         // Two parts that together are a listed word are that word (`lég` + `záró` is
         // `légzáró`), which compounds only as its own flags allow.
-        let joined = format!("{left}{right}");
-        if self.stem_mask(&joined).is_some() {
+        let Some(joined) = w.get(a..d) else { return false };
+        if self.stem_mask(joined).is_some() {
             return false;
         }
-        if cfg.check_rep && self.rep_misspelling(&joined, budget) {
+        if cfg.check_rep && self.rep_misspelling(joined, budget) {
             return false;
         }
         let mut l = left.chars().rev();
@@ -543,8 +564,10 @@ impl AffixDict {
             return false;
         }
         !cfg.patterns.iter().any(|p| {
+            // `0`: the previous part's stem ends at the boundary, prefixed or not (`el` `kis` +
+            // `szék`), as in Hunspell.
             let end = if p.end == "0" {
-                self.stem_mask(left).is_some_and(|m| p.end_flag.is_empty() || m.meets(p.end_flag))
+                prev.suffixless && (p.end_flag.is_empty() || prev.stem.meets(p.end_flag))
             } else {
                 left.ends_with(p.end.as_str()) && (p.end_flag.is_empty() || prev.stem.meets(p.end_flag))
             };
@@ -608,13 +631,15 @@ impl AffixDict {
             return parts >= 2 && rule.get(at..).unwrap_or_default().iter().all(|e| e.1 != Repeat::One);
         }
         let Some(&(flag, repeat)) = rule.get(at) else { return false };
-        if parts >= MAX_PARTS || s.budget == 0 {
+        // Parts are at least `COMPOUNDMIN` letters, as in Hunspell, and as many as the word
+        // holds (`1111111111111-es`): each is shorter than the word, so the depth is bounded.
+        if s.budget == 0 {
             return false;
         }
         if repeat != Repeat::One && self.rule_from(s, rule, at + 1, start, parts) {
             return true;
         }
-        for end in (start + 1)..=last_bound {
+        for end in (start + self.compound.min)..=last_bound {
             s.budget = s.budget.saturating_sub(1);
             if s.budget == 0 {
                 return false;
@@ -671,7 +696,10 @@ impl AffixDict {
                     continue;
                 }
                 st.budget -= 1;
-                if self.side_ok(left, deny, st) && self.side_ok(right, deny, st) {
+                // In a Hungarian dictionary the left side of a hyphen may also be a listed word
+                // with the hyphen (`vegyiáru-` + `kereskedés`), as in Hunspell.
+                let dash = || self.compound.hungarian && b == "-" && left.len() < super::MAX_WORD_BYTES;
+                if self.side_ok(right, deny, st) && (self.side_ok(left, deny, st) || (dash() && self.side_ok(&format!("{left}-"), deny, st))) {
                     return true;
                 }
             }
@@ -802,9 +830,9 @@ ipso facto\t1
         // `ó` carries the compound flag and the permit flag; `ban` neither; `i` forbids the
         // first and middle places but may end a compound.
         assert_words(&d, &["váró", "váróház", "házi", "almaházi"], &["házbanalma", "háziház"]);
-        // A part carries one suffix: `váróban` (vár + ó + ban) is a word, but not a compound part.
-        assert!(d.check("váróban"));
-        assert!(!d.check("almaváróban"));
+        // Two suffixes in a row (vár + ó + ban) need COMPOUNDMORESUFFIXES before the last part;
+        // the last is checked like a word, as Hunspell does: `almaváróban` is correct.
+        assert!(d.check("váróban") && d.check("almaváróban"));
         let more = AffixDict::from_hunspell(&format!("{AFF}COMPOUNDMORESUFFIXES\n"), DIC, &[]).unwrap();
         assert!(more.check("almaváróban"));
     }
@@ -871,8 +899,9 @@ ipso facto\t1
         let d = dict();
         assert_words(
             &d,
-            &["1999-es", "19-es", "alma-ház", "-alma", "alma-féle", "alma-ház-tető", "SMS-ben", "SMS-BEN"],
-            &["1999", "19x", "alma-xyz", "alma-", "SMS-BAN"],
+            // `COMPOUNDMIN 2`: `1999-es` is wrong here, as in Hunspell.
+            &["9-es", "alma-ház", "-alma", "alma-féle", "alma-ház-tető", "SMS-ben", "SMS-BEN"],
+            &["1999", "1999-es", "19-es", "19x", "alma-xyz", "alma-", "SMS-BAN"],
         );
     }
 
@@ -926,7 +955,7 @@ ipso facto\t1
         let back = AffixDict::from_bytes(&d.to_bytes()).unwrap();
         assert_words(
             &back,
-            &["almafa", "kisház", "váróház", "mikroház", "1999-es", "alma-ház", "Petőfi-ház", "almatetőkulcsfaban"],
+            &["almafa", "kisház", "váróház", "mikroház", "9-es", "alma-ház", "Petőfi-ház", "almatetőkulcsfaban"],
             &["házkis", "sakkkör", "hajlak", "mikro", "üzelm", "Petőfi-híd", "almaház", "almatetőkulcsalma"],
         );
     }
@@ -1000,17 +1029,67 @@ ipso facto\t1
     }
 
     #[test]
-    fn a_later_prefix_needs_the_compound_flag_only_in_hungarian() {
-        // Hunspell compounds `anyag` + `el` `szánt` when the prefix has the permit flag, with
-        // `LANG hu_HU` or without; the Hungarian reading here asks for the compound flag, which
-        // matches the Hungarian dictionary closer (see `part_ok`), and only for it.
-        let aff = "SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDPERMITFLAG P\nCOMPOUNDMIN 2\nPFX e Y 1\nPFX e 0 el/P .\nPFX f Y 1\nPFX f 0 fel/PY .\n";
-        let dic = "2\nanyag/Ye\nszánt/Yef\n";
+    fn a_later_prefix_needs_the_permit_flag() {
+        // As the Hunspell 1.7 command line reads it, with `LANG hu_HU` or without: after the
+        // first part a prefix needs `COMPOUNDPERMITFLAG`; the compound flag on it isn't enough.
+        let aff = "SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDPERMITFLAG P\nCOMPOUNDMIN 2\nPFX e Y 1\nPFX e 0 el .\nPFX g Y 1\nPFX g 0 ki/Y .\nPFX h Y 1\nPFX h 0 be/P .\n";
+        let dic = "2\nanyag/Yegh\nszánt/Yegh\n";
+        for aff in [aff.to_string(), format!("LANG hu_HU\n{aff}")] {
+            let d = AffixDict::from_hunspell(&aff, dic, &[]).unwrap();
+            assert_words(&d, &["elszánt", "anyagbeszánt", "elanyagszánt"], &["anyagelszánt", "anyagkiszánt"]);
+            assert!(!AffixDict::from_bytes(&d.to_bytes()).unwrap().check("anyagkiszánt"));
+        }
+    }
+
+    #[test]
+    fn homonyms_are_parsed_one_by_one() {
+        // `szán` the noun compounds, `szán` the verb takes the prefix: `el` + `szán` + `t` is no
+        // compound part, as in Hunspell (the Hungarian `előanyagelszánt`).
+        let aff = "SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDPERMITFLAG P\nCOMPOUNDMIN 2\nPFX e Y 1\nPFX e 0 el/P .\nSFX t Y 1\nSFX t 0 t .\n";
+        let d = AffixDict::from_hunspell(aff, "3\nanyag/Y\nszán/Y\nszán/et\n", &[]).unwrap();
+        assert_words(&d, &["szán", "elszán", "elszánt", "anyagszán", "szánt"], &["anyagelszánt", "anyagelszán"]);
+        let back = AffixDict::from_bytes(&d.to_bytes()).unwrap();
+        assert_words(&back, &["elszánt", "anyagszán"], &["anyagelszánt"]);
+    }
+
+    #[test]
+    fn hungarian_long_prefixes_and_hyphens() {
+        // With `LANG hu_HU`, as in Hunspell: a prefix of two syllables after the first part
+        // counts as a word for the 6–3 rule, and the left side of a hyphen may be listed with it.
+        let aff = "SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDPERMITFLAG P\nCOMPOUNDMIN 2\nCOMPOUNDWORDMAX 2\nCOMPOUNDSYLLABLE 6 aáeéiíoóöőuúüű\nPFX e Y 2\nPFX e 0 elő/P .\nPFX e 0 be/P .\nBREAK 1\nBREAK -\n";
+        let dic = "4\nkerekasztal/Y\ndöntőbíró/Ye\nvegyiáru-\nkereskedés\n";
         let plain = AffixDict::from_hunspell(aff, dic, &[]).unwrap();
-        assert_words(&plain, &["elszánt", "anyagelszánt", "anyagfelszánt", "elanyagszánt"], &[]);
+        assert_words(&plain, &["kerekasztalelődöntőbíró", "kerekasztalbedöntőbíró"], &["vegyiáru-kereskedés", "vegyiáru"]);
         let hu = AffixDict::from_hunspell(&format!("LANG hu_HU\n{aff}"), dic, &[]).unwrap();
-        assert_words(&hu, &["elszánt", "anyagfelszánt", "elanyagszánt"], &["anyagelszánt"]);
-        assert!(!AffixDict::from_bytes(&hu.to_bytes()).unwrap().check("anyagelszánt"), "the compact format keeps the language");
+        assert_words(&hu, &["kerekasztalbedöntőbíró", "vegyiáru-kereskedés", "VEGYIÁRU-KERESKEDÉS"], &["kerekasztalelődöntőbíró", "vegyiáru"]);
+    }
+
+    #[test]
+    fn forbidden_readings_stop_the_check() {
+        // Hunspell: a reading that is a listed FORBIDDENWORD makes the word wrong, before any
+        // lower-case reading or break is tried.
+        let d = AffixDict::from_hunspell("SET UTF-8\nFORBIDDENWORD W\nBREAK 1\nBREAK -\n", "5\nijs\nIjs/W\nalma\nfa\nalma-fa/W\n", &[]).unwrap();
+        assert_words(&d, &["ijs", "alma", "fa"], &["Ijs", "IJS", "IJs", "alma-fa", "Alma-fa", "ALMA-FA"]);
+    }
+
+    #[test]
+    fn compound_rules_take_any_number_of_parts_of_compoundmin_letters() {
+        // Hunspell 1.7: `1` repeated as often as the word holds (60 times here), but no part
+        // shorter than `COMPOUNDMIN`: with 2, `1999-es` is wrong.
+        let dic = "4\n1/n\n9/n\n0/n\n9-es/m\n";
+        let one = AffixDict::from_hunspell("SET UTF-8\nCOMPOUNDMIN 1\nCOMPOUNDRULE 1\nCOMPOUNDRULE n*m\n", dic, &[]).unwrap();
+        assert_words(&one, &["1999-es", "19-es", &format!("{}9-es", "1".repeat(60))], &["1999", "1-es"]);
+        let two = AffixDict::from_hunspell("SET UTF-8\nCOMPOUNDMIN 2\nCOMPOUNDRULE 1\nCOMPOUNDRULE n*m\n", dic, &[]).unwrap();
+        assert_words(&two, &["9-es"], &["1999-es", "19-es"]);
+    }
+
+    #[test]
+    fn a_zero_pattern_meets_a_prefixed_stem() {
+        // `CHECKCOMPOUNDPATTERN 0 sz`: a part whose stem ends at the boundary, prefixed or not,
+        // before `sz…` (Hunspell rejects `kisszék` and `elkisszék`, accepts `házosszék`).
+        let aff = "SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDPERMITFLAG P\nCOMPOUNDMIN 2\nCHECKCOMPOUNDPATTERN 1\nCHECKCOMPOUNDPATTERN 0 sz\nPFX e Y 1\nPFX e 0 el/P .\nSFX s Y 1\nSFX s 0 os/P .\n";
+        let d = AffixDict::from_hunspell(aff, "3\nkis/Ye\nszék/Y\nház/Ys\n", &[]).unwrap();
+        assert_words(&d, &["házosszék", "székház"], &["kisszék", "elkisszék", "házszék"]);
     }
 
     #[test]
@@ -1036,6 +1115,20 @@ ipso facto\t1
         assert!(!forms.iter().any(|f| f == "üzelm") && forms.iter().any(|f| f == "üzelmok"), "{forms:?}");
         for f in forms {
             assert!(d.check(&f), "{f}");
+        }
+    }
+
+    #[test]
+    fn forms_leave_out_affixes_that_need_more() {
+        // `ó/N`: the form needs another affix; `é/O`: it stands only inside compounds; `ó/Ns`
+        // chains to `k`, which is a word again.
+        let aff = "SET UTF-8\nNEEDAFFIX N\nONLYINCOMPOUND O\nSFX d Y 1\nSFX d 0 ó/Ns .\nSFX e Y 1\nSFX e 0 é/O .\nSFX s Y 1\nSFX s 0 k .\n";
+        let d = AffixDict::from_hunspell(aff, "1\nvár/de\n", &[]).unwrap();
+        let forms = d.forms("vár");
+        assert!(!forms.iter().any(|f| f == "váró" || f == "váré"), "{forms:?}");
+        assert!(forms.iter().any(|f| f == "várók"), "{forms:?}");
+        for f in &forms {
+            assert!(d.check(f), "{f}");
         }
     }
 
