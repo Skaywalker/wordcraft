@@ -1225,6 +1225,12 @@ impl AffixDict {
         self.simple_except(w, Mask::EMPTY)
     }
 
+    /// May forms of the stem `stem` be suggested: not `FORBIDDENWORD`, `NOSUGGEST`, `SUBSTANDARD`
+    /// or `ONLYINCOMPOUND`?
+    pub fn suggestible_stem(&self, stem: &str) -> bool {
+        self.stem_mask(stem).is_some_and(|m| !m.meets(self.forbidden | self.no_suggest | self.substandard | self.compound.only_in))
+    }
+
     /// [`AffixDict::contains_simple`] for words eligible for suggestions (NOSUGGEST and
     /// SUBSTANDARD stems excluded).
     pub fn contains_simple_suggestible(&self, w: &str) -> bool {

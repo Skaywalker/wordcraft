@@ -39,9 +39,12 @@ const MAX_MAP_CHANGES: usize = 4;
 const MAX_MAP_VARIANTS: usize = 4096;
 /// Stems the scan of round 6 expands.
 const SCAN_STEMS: usize = 48;
-/// Candidates checked as compounds in each of rounds 2 to 5: a compound search costs far more
-/// than a plain lookup, and the accent round alone may try thousands of spellings.
+/// Candidates checked as compounds in rounds 3 to 5: a compound search costs far more than a
+/// plain lookup.
 const COMPOUND_CHECKS: usize = 120;
+/// Candidates checked as compounds in round 2, which may try thousands of accent spellings
+/// (`gyumolcsoskosarban` → `gyümölcsöskosárban` is found after hundreds); most fail at once.
+const ACCENT_COMPOUND_CHECKS: usize = 1000;
 /// A suggestion that is a word only as a compound ranks after a plain word at the same cost.
 const COST_COMPOUND: u32 = 3;
 
@@ -101,12 +104,9 @@ impl Collector<'_> {
         self.keep(words.join(" "), cost);
     }
 
-    /// Keep a suggestion known to be correct, unless one of its words may not be suggested (a
-    /// `NOSUGGEST`, `SUBSTANDARD` or compound-only form from the scan of round 6).
+    /// Keep a suggestion known to be correct and suggestible (the callers check: [`offer`] with
+    /// the suggestible lookups, the scan with [`AffixDict::can_suggest`]).
     fn keep(&mut self, text: String, cost: u32) {
-        if !text.split(' ').all(|part| self.d.can_suggest(part)) {
-            return;
-        }
         self.seq += 1;
         let seq = self.seq;
         let e = self.found.entry(text).or_insert((cost, seq));
@@ -218,13 +218,16 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     let case = casing(word);
     let input = word.to_lowercase();
     let chars: Vec<char> = input.chars().collect();
-    let mut col = Collector { d, input: input.clone(), tested: HashSet::new(), found: HashMap::new(), seq: 0, compound_checks: COMPOUND_CHECKS };
+    let mut col =
+        Collector { d, input: input.clone(), tested: HashSet::new(), found: HashMap::new(), seq: 0, compound_checks: ACCENT_COMPOUND_CHECKS };
     // 1. Letter case.
     if d.contains_suggestible(&input) && word != input {
         col.keep(input.clone(), COST_CASE);
     } else if d.contains_suggestible(&capitalize(&input)) && word != capitalize(&input) {
         col.keep(capitalize(&input), COST_CASE);
     }
+    // An abbreviation without its period (`pl` → `pl.`).
+    col.offer(&format!("{input}."), COST_ADD_DIACRITIC);
     // 2. Diacritics and other MAP slips.
     let map = d.map();
     let alts: Vec<Vec<char>> = chars.iter().map(|&c| alternatives(c, map)).collect();
@@ -339,7 +342,8 @@ fn scan(col: &mut Collector, chars: &[char]) {
     let mut best: Vec<(u32, &str)> = Vec::new();
     for f in firsts {
         let prefix = f.to_string();
-        for stem in d.stems_with_prefix(&prefix) {
+        // Stems that can't be suggested (NOSUGGEST, compound-only…) take no place in the scan.
+        for stem in d.stems_with_prefix(&prefix).filter(|s| d.suggestible_stem(s)) {
             let sf: Vec<char> = stem.chars().map(|c| fold(c, map)).collect();
             let shared = std::iter::once(' ').chain(sf.iter().copied()).zip(sf.iter().copied()).filter(|p| pairs.contains(p)).count();
             if shared < 2 {
@@ -372,7 +376,7 @@ fn scan(col: &mut Collector, chars: &[char]) {
                 continue;
             }
             let dist = weighted_distance(&lf, chars, &related, limit);
-            if dist <= limit && lf.as_slice() != chars {
+            if dist <= limit && lf.as_slice() != chars && d.can_suggest(&form) {
                 col.keep(form, COST_SCAN + dist * 3);
             }
         }
@@ -436,6 +440,14 @@ mod tests {
             assert!(!s.iter().any(|x| x.to_lowercase().contains("ócska") || x == "kertész"), "{w} → {s:?}");
         }
         crate::affix::tests::assert_nosuggest_is_honoured(suggest_in);
+    }
+
+    #[test]
+    fn an_abbreviation_gets_its_period() {
+        // Hunspell offers `pl.` for `pl`.
+        crate::hu::test_dict::install();
+        assert_eq!(suggest("pl", 3).first().map(String::as_str), Some("pl."));
+        has("stb", "stb.");
     }
 
     #[test]

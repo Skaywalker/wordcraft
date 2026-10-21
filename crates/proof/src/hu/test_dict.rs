@@ -41,10 +41,12 @@ SFX N Y 1
 SFX N 0 en .
 SFX M Y 1
 SFX M 0 mel m
+SFX R Y 1
+SFX R 0 -ban .
 ";
 
 /// Stems (the count line first, as in Hunspell files).
-pub const DIC: &str = "57
+pub const DIC: &str = "59
 ház/YA
 alma/YA
 fa/YA
@@ -99,6 +101,8 @@ május
 fejezet
 pl.
 stb.
+Kft./R
+érk.
 ócska/!A
 kertész/YO
 ";

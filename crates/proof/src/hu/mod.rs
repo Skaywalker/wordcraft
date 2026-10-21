@@ -99,6 +99,26 @@ fn is_latin_letter(c: char) -> bool {
     c.is_alphabetic() && (c < '\u{0250}' || ('\u{1E00}'..='\u{1EFF}').contains(&c))
 }
 
+/// The text the word at `a..b` of `text` is checked as: with the period that follows it (`pl.`,
+/// an abbreviation the dictionary may list with it), and with a hyphenated ending after that
+/// period (`Kft.-ben`, `szept.-ben`), or — for the ending itself — from the abbreviation before
+/// it. `None`: the word alone.
+pub(crate) fn spelling_span(text: &str, a: usize, b: usize) -> Option<(usize, usize)> {
+    let is_w = |c: char| c.is_alphanumeric();
+    let word_end = |from: usize| text.get(from..).map(|r| from + r.find(|c: char| !is_w(c)).unwrap_or(r.len()));
+    if text.get(b..)?.starts_with(".-") {
+        let end = word_end(b + 2)?;
+        return Some((a, if end > b + 2 { end } else { b + 1 }));
+    }
+    if text.get(b..)?.starts_with('.') {
+        return Some((a, b + 1));
+    }
+    // The ending after an abbreviation: `ben` in `Kft.-ben`.
+    let before = text.get(..a)?.strip_suffix(".-")?;
+    let start = before.rfind(|c: char| !is_w(c)).map_or(0, |i| i + before.get(i..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8));
+    (start < before.len()).then_some((start, b))
+}
+
 /// Is `word` spelled correctly in Hungarian? Numbers and words with digits (`2026-ban` follows
 /// the number's own rules), single letters, short words in capitals (acronyms: `MÁV`, `OTP`) and
 /// words in other scripts are accepted, and so is every word when no Hungarian dictionary is
@@ -208,6 +228,23 @@ mod tests {
         let text = "A ház pl szép";
         let issues = crate::check_spelling_in(text, crate::ProofLang::Hu);
         assert_eq!(issues.iter().map(|i| &text[i.start..i.end]).collect::<Vec<_>>(), ["pl"]);
+    }
+
+    #[test]
+    fn abbreviations_take_hyphenated_endings() {
+        // `Kft.-ban` is one word, as with the Hunspell command line (`Kft.-ben`, `stb.-vel`): its
+        // ending isn't a word of its own. Without the period it stays wrong.
+        test_dict::install();
+        let ok = "A Kft.-ban szép ház.";
+        assert!(crate::check_spelling_in(ok, crate::ProofLang::Hu).is_empty(), "{:?}", crate::check_spelling_in(ok, crate::ProofLang::Hu));
+        let text = "A Kft-ban szép ház.";
+        let issues = crate::check_spelling_in(text, crate::ProofLang::Hu);
+        assert!(!issues.is_empty());
+        assert_eq!(spelling_span("Kft.-ban x", 0, 3), Some((0, 8)));
+        assert_eq!(spelling_span("Kft.-ban x", 5, 8), Some((0, 8)));
+        assert_eq!(spelling_span("pl. x", 0, 2), Some((0, 3)));
+        assert_eq!(spelling_span("Kft.- x", 0, 3), Some((0, 4)));
+        assert_eq!(spelling_span("ház x", 0, 4), None);
     }
 
     #[test]

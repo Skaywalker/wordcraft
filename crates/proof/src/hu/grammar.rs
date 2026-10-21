@@ -78,8 +78,10 @@ const CLAUSE_OPENERS: &[&str] = &[
 const RELATIVE_STEMS: &[(&str, &str)] = &[("ami", "k"), ("aki", "k"), ("amely", "ek"), ("amelyik", "ek")];
 
 /// The case endings of a relative pronoun: `ami` + `nek`, `amely` + `ben`, `akik` + `kel`.
-const RELATIVE_ENDINGS: &[&str] =
-    &["", "t", "et", "nek", "ben", "ből", "be", "n", "en", "ről", "re", "től", "hez", "vel", "kel", "ért", "vé", "ké", "ig", "ként"];
+const RELATIVE_ENDINGS: &[&str] = &[
+    "", "t", "et", "nek", "nél", "ben", "ből", "be", "n", "en", "ről", "re", "től", "hez", "vel", "kel", "ért", "vé", "ké", "ig", "ként", "képp",
+    "képpen",
+];
 
 /// Relative pronouns whose ending changes the stem (`amely` + `vel` → `amellyel`).
 const RELATIVE_ASSIMILATED: &[&str] = &["amellyel", "amellyé", "amelyikkel"];
@@ -219,8 +221,9 @@ fn spaces(text: &str, v: &mut Vec<Issue>) {
             ',' => true,
             // `;)` and `;-)` are emoticons.
             ';' => !matches!(after, Some(')' | '(' | '-' | 'P' | 'D')),
-            // ` ...` is an ellipsis, ` .5` a number, ` .docx` and ` .NET` names.
-            '.' => !after.is_some_and(|a| a == '.' || a.is_alphanumeric()),
+            // ` ...` is an ellipsis, ` .5` a number, ` .docx` and ` .NET` names; ` .Aztán` is a
+            // stray space.
+            '.' => !matches!(after, Some('.')) && !after.is_some_and(|a| a.is_ascii_digit()) && !file_name_at(rest.get(1..).unwrap_or("")),
             // ` :)`, ` :-)`, ` :D` and similar are emoticons; ` ?!` is still a stray space.
             ':' | '!' | '?' => after.is_none_or(|a| a.is_whitespace() || matches!(a, '"' | '”' | '»' | '’' | '!' | '?')),
             _ => false,
@@ -237,6 +240,14 @@ fn spaces(text: &str, v: &mut Vec<Issue>) {
     }
 }
 
+/// Does `s` start with a file extension or a name written with a leading period: lower-case
+/// letters or digits (`docx`, `mp3`) or `NET`, up to the end of the word?
+fn file_name_at(s: &str) -> bool {
+    let n = s.find(|c: char| !c.is_alphanumeric()).unwrap_or(s.len());
+    let Some(name) = s.get(..n) else { return false };
+    !name.is_empty() && (name == "NET" || name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
+}
+
 /// Is `prev`, before a period, an abbreviation, an initial, a number (an ordinal or a date:
 /// `3. fejezet`, `2026. október`) or a Roman numeral, after which a lower-case word doesn't start
 /// a sentence?
@@ -245,6 +256,13 @@ fn abbreviation_or_number(prev: &str) -> bool {
         || prev.chars().any(|c| c.is_ascii_digit())
         || (prev.chars().all(|c| matches!(c, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M')))
         || ABBREVIATIONS.contains(&prev.to_lowercase().as_str())
+        || listed_abbreviation(prev)
+}
+
+/// Does the loaded dictionary list `prev` with a period (`érk.`, `ény.`)?
+fn listed_abbreviation(prev: &str) -> bool {
+    let d = super::dictionary();
+    !d.is_empty() && d.contains_simple(&format!("{}.", prev.to_lowercase()))
 }
 
 const CLOSING: [char; 8] = ['"', '”', '’', '\'', ')', '»', ']', '\u{1}'];
@@ -283,6 +301,26 @@ fn sentence_capitals(text: &str, ws: &[(usize, usize)], capital_first: bool, v: 
     }
 }
 
+/// Is the word before `ws[k]` a name, so `de` is a name particle (`Charles de Gaulle`, `Jean de
+/// la Fontaine`)? It is capitalized and either inside the sentence or, at its start, no word in
+/// lower case (`Szép de drága`: `szép` is one, so that `de` takes a comma).
+fn name_before(text: &str, ws: &[(usize, usize)], k: usize) -> bool {
+    let Some(&(pa, pb)) = k.checked_sub(1).and_then(|i| ws.get(i)) else { return false };
+    let Some(prev) = text.get(pa..pb) else { return false };
+    if !prev.chars().next().is_some_and(char::is_uppercase) {
+        return false;
+    }
+    let sentence_start = match k.checked_sub(2).and_then(|i| ws.get(i)) {
+        None => true,
+        Some(&(qa, qb)) => ends_sentence(text.get(qb..pa).unwrap_or(""), text.get(qa..qb).unwrap_or("")),
+    };
+    if !sentence_start {
+        return true;
+    }
+    let d = super::dictionary();
+    !d.is_empty() && !d.check(&prev.to_lowercase())
+}
+
 /// Is `w` (lower case) a form of a relative pronoun: a stem, optionally its plural, and a case
 /// ending? (`amiatt` points back, `aminosav` is a noun: neither is one.)
 fn relative_pronoun(w: &str) -> bool {
@@ -315,7 +353,7 @@ fn missing_commas(text: &str, ws: &[(usize, usize)], v: &mut Vec<Issue>) {
             continue;
         }
         let next = ws.get(k + 1).and_then(|&(na, nb)| text.get(na..nb)).unwrap_or("");
-        if w == "de" && (next.chars().next().is_some_and(char::is_uppercase) || DE_PARTICLE_BEFORE.contains(&next.to_lowercase().as_str())) {
+        if w == "de" && (DE_PARTICLE_BEFORE.contains(&next.to_lowercase().as_str()) || name_before(text, ws, k)) {
             continue;
         }
         if w == "mert" && (MERT_VERB_BEFORE.contains(&p.as_str()) || (next.ends_with("ni") && next.chars().count() > 3) || next == "volna") {
@@ -427,7 +465,8 @@ mod tests {
         assert!(m.contains(&"Felesleges szóköz az írásjel előtt@ ?".to_string()), "{m:?}");
         assert!(m.contains(&"Dupla szóköz@  ".to_string()), "{m:?}");
         clean("Remek :) Tényleg :-) Vagy :D Az érték .5 és három pont ...");
-        clean("Megnyitottam a .docx fájlt, a .NET keretrendszerrel.");
+        clean("Megnyitottam a .docx fájlt, a .NET keretrendszerrel és az .mp3 zenét.");
+        assert!(messages("Elment .Aztán jött.").iter().any(|m| m.starts_with("Felesleges szóköz")));
         let m = messages("Azt mondta ,,igen” és elment.. Aztán;; vége.");
         assert_eq!(m.iter().filter(|x| x.starts_with("Kettőzött")).count(), 3, "{m:?}");
         assert_eq!(check("Azt mondta ,,igen”.").iter().find(|i| i.message.starts_with("Kettőzött")).unwrap().suggestions, ["„"]);
@@ -442,6 +481,9 @@ mod tests {
         clean("Vettem gyümölcsöt, pl. almát, körtét stb. és zöldséget.");
         clean("Kb. tíz perc múlva, ill. fél óra múlva jön.");
         clean("Dr. Kovács és ifj. Nagy János a 3. fejezetet olvasta.");
+        // An abbreviation the dictionary lists with its period.
+        crate::hu::test_dict::install();
+        clean("Az érk. dátuma.");
         clean("A rendezvény 2026. október 15. napján lesz.");
         clean("Vártam... aztán végre megjött.");
         clean("– Tényleg? – kérdezte. – Igen – felelte.");
@@ -479,6 +521,15 @@ mod tests {
         clean("A fehérjék aminosavai és a nyál amilázai, az aminok sói.");
         let m = messages("Szép de drága. Ez az amelyben élünk. Láttam azt amellyel jött. Azok akikkel beszéltem.");
         for want in ["„de”", "„amelyben”", "„amellyel”", "„akikkel”"] {
+            assert!(m.iter().any(|x| x.contains(want)), "{want}: {m:?}");
+        }
+        // A capitalized word before `de` makes it a name particle inside a sentence, or at its
+        // start when the word isn't a common one; `amelynél` and `akinél` are relative pronouns.
+        crate::hu::test_dict::install();
+        clean("Ezt Jean de la Fontaine írta.");
+        clean("Jean de la Fontaine írta.");
+        let m = messages("Szép de Anna nem jött el. Ez az amelynél jobb nincs. Az akinél van.");
+        for want in ["„de”", "„amelynél”", "„akinél”"] {
             assert!(m.iter().any(|x| x.contains(want)), "{want}: {m:?}");
         }
     }
