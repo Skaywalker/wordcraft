@@ -9,8 +9,9 @@
 //! One connection speaks one sentence: it names the client, asks for the begin, end, cancel and
 //! pause events, sets the rate and language, sends the text, and waits for the sentence's end
 //! event. A sentence another client's message cancels (a screen reader's announcement) is sent
-//! again after a pause, twice at most; a sentence cancelled once more, paused by another client,
-//! or never started halts reading on it ([`Outcome::Halted`]).
+//! again after a pause, twice at most; a sentence cancelled once more or paused by another
+//! client halts reading on it ([`Outcome::Halted`]), and so does one that never began
+//! ([`Outcome::NotStarted`]).
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
