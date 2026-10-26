@@ -205,6 +205,20 @@ fn every_reading_counts_as_a_new_one() {
     r.stop();
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn a_sentence_that_never_began_says_so_not_another_program() {
+    // No begin event within the queue bound: no other program need be involved, so the
+    // message names the sentence not starting, not another program stopping it.
+    let halted = |o| match dispatcher_spoken(Ok(o)) {
+        Spoken::Halted(m) => m,
+        _ => String::new(),
+    };
+    assert_eq!(halted(ssip::Outcome::NotStarted), NOT_STARTED);
+    assert!(!NOT_STARTED.contains("another program"));
+    assert_eq!(halted(ssip::Outcome::Halted), HALTED_BY_OTHER);
+}
+
 #[test]
 fn play_after_a_failed_sentence_plays_it_again() {
     // A sentence whose end never came stops reading with an error (as the worker does on a

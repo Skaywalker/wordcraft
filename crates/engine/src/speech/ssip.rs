@@ -58,9 +58,12 @@ pub(super) enum Outcome {
     Done,
     /// Reading moved on: the sentence was cancelled.
     Interrupted,
-    /// Another client stopped it: cancelled it again after it was sent again, paused it, or kept
-    /// it from beginning. Reading halts on it instead of fighting the other client.
+    /// Another client stopped it: cancelled it again after it was sent again, or paused it.
+    /// Reading halts on it instead of fighting the other client.
     Halted,
+    /// The sentence never began: queued too long, behind other clients' speech, paused before it
+    /// began (which sends no event), or with a speech module that doesn't start. Reading halts on it.
+    NotStarted,
 }
 
 /// Where Speech Dispatcher listens.
@@ -435,7 +438,8 @@ impl<W: Write, R: Read> Conversation<'_, W, R> {
                     Some(pause) => self.wait(*pause)?,
                     None => return Ok(Outcome::Halted),
                 },
-                Fate::Paused | Fate::NotStarted => return Ok(Outcome::Halted),
+                Fate::Paused => return Ok(Outcome::Halted),
+                Fate::NotStarted => return Ok(Outcome::NotStarted),
             }
         }
     }
@@ -719,7 +723,7 @@ mod tests {
         let h = server(srv, Ending::NeverBegins);
         let req = Request { text: "Queued behind another client.", rate: 0, lang: None };
         let start = Instant::now();
-        assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap(), Outcome::Halted);
+        assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap(), Outcome::NotStarted);
         assert!(start.elapsed() >= QUEUE_WAIT && start.elapsed() < QUEUE_WAIT + REPLY_TIMEOUT * 2, "{:?}", start.elapsed());
         assert!(h.join().unwrap().contains(&"CANCEL self".to_string()));
     }
