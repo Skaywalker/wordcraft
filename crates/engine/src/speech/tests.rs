@@ -607,16 +607,15 @@ fn a_player_waiting_to_speak_its_next_sentence_is_told_it_lost_the_speech() {
     let mut other = ReadAloud::default();
     other.backend = Backend::Hold;
     other.start(sentences(&Document::from_text("Three."), &Pos::body(0, 0), None, true));
-    let owner = speech_owner(None, Some(Arc::downgrade(&reading.shared)));
+    // As `web::owner` finds it: nothing being spoken, the waiting sentence's player.
+    let owner = None.or(Some(Arc::downgrade(&reading.shared)));
     assert!(may_cancel(owner.as_ref(), &other.shared, true));
-    if let Some(lost) = owner.and_then(|o| o.upgrade()).filter(|o| !Arc::ptr_eq(o, &other.shared)) {
-        speech_taken_over(&lost);
-    }
+    lose_speech(owner, &other.shared);
     assert_eq!(reading.state(), State::Paused);
     assert_eq!(other.state(), State::Playing);
-    // The utterance being spoken wins over a waiting one.
-    let spoken = speech_owner(Some(Arc::downgrade(&other.shared)), Some(Arc::downgrade(&reading.shared)));
-    assert!(spoken.is_some_and(|o| std::sync::Weak::ptr_eq(&o, &Arc::downgrade(&other.shared))));
+    // A player taking over from itself (a change while it reads) doesn't pause.
+    lose_speech(Some(Arc::downgrade(&other.shared)), &other.shared);
+    assert_eq!(other.state(), State::Playing);
     reading.stop();
     other.stop();
 }

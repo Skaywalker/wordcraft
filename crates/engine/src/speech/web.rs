@@ -18,8 +18,8 @@ use wasm_bindgen::closure::Closure;
 use web_sys::{SpeechSynthesis, SpeechSynthesisUtterance, SpeechSynthesisVoice};
 
 use super::{
-    Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, ask_browser_voices_again, lock, may_cancel, plain_tag, speech_owner, speech_taken_over,
-    voice_for, web_retry, web_sentence_limit_ms,
+    Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, ask_browser_voices_again, lock, lose_speech, may_cancel, plain_tag, voice_for, web_retry,
+    web_sentence_limit_ms,
 };
 
 type Handler = Closure<dyn FnMut(web_sys::Event)>;
@@ -129,7 +129,7 @@ fn cancel() -> bool {
 fn owner() -> Option<Weak<Player>> {
     let current = CURRENT.with(|c| c.borrow().as_ref().map(|c| c.player.clone()));
     let deferred = DEFERRED.with(|d| d.borrow().as_ref().map(|d| d.2.clone()));
-    speech_owner(current, deferred)
+    current.or(deferred)
 }
 
 /// [`cancel`], when the sentence being spoken is `player`'s: another player going away (the
@@ -204,11 +204,7 @@ fn speak(shared: &Arc<Player>, attempt: WebAttempt) {
     if !may_cancel(owner.as_ref(), shared, playing) {
         return;
     }
-    // Another player that was speaking loses the speech (and its sentence's events and watchdog
-    // with it): it pauses, instead of waiting forever as Playing.
-    if let Some(other) = owner.and_then(|o| o.upgrade()).filter(|o| !Arc::ptr_eq(o, shared)) {
-        speech_taken_over(&other);
-    }
+    lose_speech(owner, shared);
     if !cancel() {
         return speak_now(shared, attempt);
     }
