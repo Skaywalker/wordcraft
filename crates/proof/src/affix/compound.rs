@@ -5,7 +5,7 @@
 //!
 //! - **Compound flags.** A part needs `COMPOUNDFLAG` or the flag for its place (`COMPOUNDBEGIN`,
 //!   `COMPOUNDMIDDLE`, `COMPOUNDEND`), on the stem or on an affix's continuation classes. A
-//!   prefix may start a compound and a suffix may end it; a prefix further on needs
+//!   prefix may start a compound and a suffix may end it; a prefix on the last part needs
 //!   `COMPOUNDPERMITFLAG`, a suffix before the end that or a compound flag of its own.
 //!   `COMPOUNDFORBIDFLAG`, on a stem or a suffix, keeps the word out of the first and middle
 //!   places (`nárciszmetrózik` ends in one). `ONLYINCOMPOUND` stems and affixes appear only
@@ -16,7 +16,7 @@
 //!   as two). Past that a compound is still correct when it has at most the `COMPOUNDSYLLABLE`
 //!   count of syllables: Hungarian's 6–3 rule, where a compound of more than two words and more
 //!   than six syllables takes a hyphen; in a Hungarian dictionary (`LANG hu_HU`) a prefix of two
-//!   syllables or more after the first part counts as a word. Syllables are the vowels
+//!   syllables or more on any part counts as a word. Syllables are the vowels
 //!   `COMPOUNDSYLLABLE` lists; the
 //!   inflections on the last part don't count. A suffix after which the word may compound again
 //!   forms a new word and counts, as do the suffix classes `SYLLABLENUM` lists. An inflected
@@ -43,9 +43,9 @@
 //!
 //! `NEEDAFFIX` stems are words only with an affix; it is read here with the other flags of this
 //! family. Searches are bounded: at most [`MAX_PARTS`] parts (`COMPOUNDRULE`: the word's length)
-//! and [`PART_BUDGET`] part and `REP` lookups per checked word, shared by its case readings and
-//! break sides (a state that failed once isn't searched again), and [`BREAK_BUDGET`] checks for
-//! the breaks of one word, each side checked once.
+//! and [`PART_BUDGET`] part and `REP` lookups per search (a state that failed once isn't searched
+//! again), [`WORD_PART_BUDGET`] for all the searches of one checked word (its case readings and
+//! break sides), and [`BREAK_BUDGET`] checks for the breaks of one word, each side checked once.
 
 use super::{AffixDict, Mask, Parse, Rule};
 
@@ -91,17 +91,22 @@ pub(super) const BREAK_BUDGET: u32 = 64;
 /// hyphens).
 const MAX_BREAK_POINTS: usize = 10;
 
-/// The checks of one word: the break budget left, the sides already checked, and the part
-/// budget every compound search of the word shares (its case readings and break sides).
+/// Most part lookups for all the compound searches of one checked word (its case readings and
+/// break sides together); each search gets at most [`PART_BUDGET`] of them.
+pub(super) const WORD_PART_BUDGET: u32 = 16 * PART_BUDGET;
+
+/// The checks of one word: the break budget left, the sides already checked, the part lookups
+/// left for the word, and whether a search ran out of them (its "wrong" isn't remembered).
 pub(super) struct Breaks {
     budget: u32,
     pub(super) parts: u32,
+    pub(super) exhausted: bool,
     pub(super) seen: crate::patterns::FxMap<String, bool>,
 }
 
 impl Breaks {
     pub(super) fn new() -> Breaks {
-        Breaks { budget: BREAK_BUDGET, parts: PART_BUDGET, seen: crate::patterns::FxMap::default() }
+        Breaks { budget: BREAK_BUDGET, parts: WORD_PART_BUDGET, exhausted: false, seen: crate::patterns::FxMap::default() }
     }
 }
 
@@ -464,9 +469,9 @@ impl AffixDict {
             if !self.part_ok(p, place, deny) {
                 return false;
             }
-            // In a Hungarian dictionary a prefix of more than one syllable after the first part
-            // counts as a word of its own, as in Hunspell (`kerekasztal` + `elő` + `döntőbíró`).
-            let long_prefix = c.hungarian && place != Place::First && p.prefix.is_some_and(|r| self.syllables(&r.add) > 1);
+            // In a Hungarian dictionary a prefix of more than one syllable counts as a word of its
+            // own, on any part, as in Hunspell (`kerekasztal` + `elő` + `döntőbíró`).
+            let long_prefix = c.hungarian && p.prefix.is_some_and(|r| self.syllables(&r.add) > 1);
             let words = if p.stem.meets(c.root) { 2 } else { 1 } + usize::from(long_prefix);
             let uncounted = if place == Place::Last { self.uncounted_syllables(p) } else { 0 };
             if best.is_none_or(|q| (words, std::cmp::Reverse(uncounted)) < (q.words, std::cmp::Reverse(q.uncounted))) {
@@ -506,12 +511,12 @@ impl AffixDict {
             return false;
         }
         // Inside a compound a suffix needs `COMPOUNDPERMITFLAG`, unless it carries the compound
-        // flag itself (`kedvez` + `ő` → `kedvezőpocak`); a prefix after the first part needs the
+        // flag itself (`kedvez` + `ő` → `kedvezőpocak`); a prefix on the last part needs the
         // permit flag, as in Hunspell (`anyag` + `ki/Y` `szánt` is wrong, `anyag` + `be/P` `szánt`
-        // is right). Homonyms are separate parses, so the prefix flag of the verb `szán` doesn't
+        // is right), one on a middle part doesn't (`anyag` + `elszánt` + `ház`). Homonyms are separate parses, so the prefix flag of the verb `szán` doesn't
         // join the compound flag of the noun `szán` (`előanyag` + `elszánt` is wrong).
         let inside = c.permit | c.flag | at_place;
-        if place != Place::First && p.prefix.is_some_and(|r| !r.cont.meets(c.permit)) {
+        if place == Place::Last && p.prefix.is_some_and(|r| !r.cont.meets(c.permit)) {
             return false;
         }
 
@@ -1030,13 +1035,14 @@ ipso facto\t1
 
     #[test]
     fn a_later_prefix_needs_the_permit_flag() {
-        // As the Hunspell 1.7 command line reads it, with `LANG hu_HU` or without: after the
-        // first part a prefix needs `COMPOUNDPERMITFLAG`; the compound flag on it isn't enough.
+        // As the Hunspell 1.7 command line reads it, with `LANG hu_HU` or without: on the last
+        // part a prefix needs `COMPOUNDPERMITFLAG`, the compound flag on it isn't enough; on a
+        // middle part it needs neither (`anyagelszántház`).
         let aff = "SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDPERMITFLAG P\nCOMPOUNDMIN 2\nPFX e Y 1\nPFX e 0 el .\nPFX g Y 1\nPFX g 0 ki/Y .\nPFX h Y 1\nPFX h 0 be/P .\n";
-        let dic = "2\nanyag/Yegh\nszánt/Yegh\n";
+        let dic = "3\nanyag/Yegh\nszánt/Yegh\nház/Y\n";
         for aff in [aff.to_string(), format!("LANG hu_HU\n{aff}")] {
             let d = AffixDict::from_hunspell(&aff, dic, &[]).unwrap();
-            assert_words(&d, &["elszánt", "anyagbeszánt", "elanyagszánt"], &["anyagelszánt", "anyagkiszánt"]);
+            assert_words(&d, &["elszánt", "anyagbeszánt", "elanyagszánt", "anyagelszántház"], &["anyagelszánt", "anyagkiszánt"]);
             assert!(!AffixDict::from_bytes(&d.to_bytes()).unwrap().check("anyagkiszánt"));
         }
     }
@@ -1054,14 +1060,29 @@ ipso facto\t1
 
     #[test]
     fn hungarian_long_prefixes_and_hyphens() {
-        // With `LANG hu_HU`, as in Hunspell: a prefix of two syllables after the first part
-        // counts as a word for the 6–3 rule, and the left side of a hyphen may be listed with it.
+        // With `LANG hu_HU`, as in Hunspell: a prefix of two syllables on any part counts as a
+        // word for the 6–3 rule, and the left side of a hyphen may be listed with it.
         let aff = "SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDPERMITFLAG P\nCOMPOUNDMIN 2\nCOMPOUNDWORDMAX 2\nCOMPOUNDSYLLABLE 6 aáeéiíoóöőuúüű\nPFX e Y 2\nPFX e 0 elő/P .\nPFX e 0 be/P .\nBREAK 1\nBREAK -\n";
         let dic = "4\nkerekasztal/Y\ndöntőbíró/Ye\nvegyiáru-\nkereskedés\n";
         let plain = AffixDict::from_hunspell(aff, dic, &[]).unwrap();
         assert_words(&plain, &["kerekasztalelődöntőbíró", "kerekasztalbedöntőbíró"], &["vegyiáru-kereskedés", "vegyiáru"]);
         let hu = AffixDict::from_hunspell(&format!("LANG hu_HU\n{aff}"), dic, &[]).unwrap();
         assert_words(&hu, &["kerekasztalbedöntőbíró", "vegyiáru-kereskedés", "VEGYIÁRU-KERESKEDÉS"], &["kerekasztalelődöntőbíró", "vegyiáru"]);
+        assert_words(&hu, &["bedöntőbírókerekasztal"], &["elődöntőbírókerekasztal"]);
+        assert_words(&plain, &["elődöntőbírókerekasztal"], &[]);
+    }
+
+    #[test]
+    fn long_hyphenated_compounds_get_a_budget_per_side() {
+        // Each break side has its own compound search; a reading that ran out of lookups isn't
+        // remembered as wrong. Every side here is a long compound of `COMPOUNDMIN 1` parts.
+        let d = AffixDict::from_hunspell("SET UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 1\nBREAK 1\nBREAK -\n", "3\naaa/Y\naaaa/Y\naab/Y\n", &[]).unwrap();
+        let side = format!("{}aab", "a".repeat(40));
+        for k in 2..=4 {
+            let w = vec![side.clone(); k].join("-");
+            assert!(d.check(&w) && d.check(&w.to_uppercase()) && d.check(&super::super::capitalize(&w)), "{k} sides");
+        }
+        assert!(!d.check(&format!("{side}-{}x", side)));
     }
 
     #[test]

@@ -1107,7 +1107,7 @@ impl AffixDict {
     fn check_except(&self, w: &str, deny: Mask) -> bool {
         let w = self.normalize(w);
         let mut breaks = compound::Breaks::new();
-        match self.check_case(&w, deny, &mut breaks.parts) {
+        match self.check_case(&w, deny, &mut breaks) {
             Some(found) => found,
             None => self.breaks_ok(&break_text(&w), deny, &mut breaks),
         }
@@ -1116,13 +1116,19 @@ impl AffixDict {
     /// Is one of the [`AffixDict::case_readings`] of `w` (normalized) a word? `Some(false)` when
     /// a reading met first is a listed `FORBIDDENWORD`: then the word is wrong and isn't split
     /// either, as in Hunspell (`ijs` and `Ijs/W`: `Ijs` and `IJS` are wrong; `alma-fa/W`:
-    /// `Alma-fa` is). `None` when no reading is a word.
-    fn check_case(&self, w: &str, deny: Mask, budget: &mut u32) -> Option<bool> {
+    /// `Alma-fa` is). `None` when no reading is a word. Each reading's compound search gets its
+    /// own [`compound::PART_BUDGET`], taken from what is left for the word.
+    fn check_case(&self, w: &str, deny: Mask, breaks: &mut compound::Breaks) -> Option<bool> {
         for (v, case_deny) in self.case_readings(w) {
             if self.stem_mask(&v).is_some_and(|m| m.meets(self.forbidden)) {
                 return Some(false);
             }
-            if self.is_word_in(&v, deny | case_deny, budget) {
+            let given = compound::PART_BUDGET.min(breaks.parts);
+            let mut left = given;
+            let found = self.is_word_in(&v, deny | case_deny, &mut left);
+            breaks.parts -= given - left;
+            breaks.exhausted |= left == 0;
+            if found {
                 return Some(true);
             }
         }
@@ -1160,16 +1166,21 @@ impl AffixDict {
     }
 
     /// One side of a break, checked like a whole word: in its case readings, or split again.
-    /// Each side is checked once per word.
+    /// Each side is checked once per word; a "wrong" reached by running out of lookups isn't
+    /// remembered.
     fn side_ok(&self, w: &str, deny: Mask, breaks: &mut compound::Breaks) -> bool {
         if let Some(&known) = breaks.seen.get(w) {
             return known;
         }
-        let ok = match self.check_case(w, deny, &mut breaks.parts) {
+        let outer = std::mem::take(&mut breaks.exhausted);
+        let ok = match self.check_case(w, deny, breaks) {
             Some(found) => found,
             None => self.breaks_ok(&break_text(w), deny, breaks),
         };
-        breaks.seen.insert(w.to_string(), ok);
+        if ok || !breaks.exhausted {
+            breaks.seen.insert(w.to_string(), ok);
+        }
+        breaks.exhausted |= outer;
         ok
     }
 
