@@ -827,6 +827,19 @@ fn web_retry(code: &str, attempt: WebAttempt, tailored: bool) -> WebRetry {
     }
 }
 
+/// Another player took the browser's speech over from `player`: a reading pauses on its sentence
+/// (Play carries on from it) rather than staying Playing with nothing spoken.
+#[cfg(any(target_arch = "wasm32", test))]
+fn speech_taken_over(player: &(Mutex<Shared>, Condvar)) {
+    let (m, cv) = player;
+    let mut s = lock(m);
+    if s.state == State::Playing {
+        s.state = State::Paused;
+        s.generation = s.generation.wrapping_add(1);
+        cv.notify_all();
+    }
+}
+
 /// May `player` stop the browser's speech? When it is `playing` (it takes over the speech), or
 /// when the sentence being spoken is its own (`owner`): a player that changes while stopped, or
 /// goes away (the session a template preview builds and drops), leaves another's reading alone.

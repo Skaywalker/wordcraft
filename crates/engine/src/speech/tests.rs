@@ -561,6 +561,25 @@ fn only_the_reading_player_stops_the_browser_speech() {
 }
 
 #[test]
+fn a_player_that_loses_the_browser_speech_pauses() {
+    // Two players (two documents): when one starts reading, the other, cut off with its
+    // sentence's events and watchdog, pauses on its sentence instead of hanging as Playing.
+    let mut r = ReadAloud::default();
+    r.backend = Backend::Hold;
+    r.start(sentences(&Document::from_text("One. Two."), &Pos::body(0, 0), None, true));
+    r.skip(1);
+    speech_taken_over(&r.shared);
+    assert_eq!(r.state(), State::Paused);
+    assert_eq!(r.progress().0, 1, "on the same sentence");
+    r.play_pause();
+    assert_eq!(r.state(), State::Playing, "Play carries on");
+    // A stopped player stays stopped.
+    r.stop();
+    speech_taken_over(&r.shared);
+    assert_eq!(r.state(), State::Stopped);
+}
+
+#[test]
 fn the_browser_gets_a_bounded_time_per_sentence() {
     assert_eq!(web_sentence_limit_ms(0, 1.0), 30_000.0);
     assert_eq!(web_sentence_limit_ms(600, 1.0), 270_000.0);

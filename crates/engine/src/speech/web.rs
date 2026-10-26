@@ -17,7 +17,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{SpeechSynthesis, SpeechSynthesisUtterance, SpeechSynthesisVoice};
 
-use super::{Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, lock, may_cancel, plain_tag, voice_for, web_retry, web_sentence_limit_ms};
+use super::{
+    Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, lock, may_cancel, plain_tag, speech_taken_over, voice_for, web_retry,
+    web_sentence_limit_ms,
+};
 
 type Handler = Closure<dyn FnMut(web_sys::Event)>;
 type Timer = Closure<dyn FnMut()>;
@@ -195,8 +198,14 @@ pub(super) fn sync(shared: &Arc<Player>) {
 /// spoken from a timer, once the browser has handled the cancel.
 fn speak(shared: &Arc<Player>, attempt: WebAttempt) {
     let playing = lock(&shared.0).state == State::Playing;
-    if !may_cancel(owner().as_ref(), shared, playing) {
+    let owner = owner();
+    if !may_cancel(owner.as_ref(), shared, playing) {
         return;
+    }
+    // Another player that was speaking loses the speech (and its sentence's events and watchdog
+    // with it): it pauses, instead of waiting forever as Playing.
+    if let Some(other) = owner.and_then(|o| o.upgrade()).filter(|o| !Arc::ptr_eq(o, shared)) {
+        speech_taken_over(&other);
     }
     if !cancel() {
         return speak_now(shared, attempt);
