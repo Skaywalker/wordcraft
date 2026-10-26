@@ -23,9 +23,6 @@ static PATTERNS: RwLock<Option<Arc<Patterns>>> = RwLock::new(None);
 /// File names of the Hungarian `hyphen` patterns.
 const NAMES: &[&str] = &["hyph_hu_HU.dic", "hyph_hu.dic", "hyph-hu.dic"];
 
-/// Largest pattern file read (the Hungarian one is about 2 MB).
-const MAX_FILE: u64 = 16 << 20;
-
 /// Directories that may hold `hyphen` pattern files: the dictionary folders, then the system's
 /// `hyphen` folders.
 fn search_dirs() -> Vec<PathBuf> {
@@ -63,18 +60,15 @@ fn load_installed() -> Patterns {
         log::info!("Hungarian hyphenation: no hyph_hu_HU.dic installed, using the syllable rules");
         return Patterns::default();
     };
+    // The size-capped reader the dictionaries use (#3661): the read itself is bounded.
     let read = || -> Result<String, String> {
-        let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-        if len > MAX_FILE {
-            return Err(format!("too large ({len} bytes)"));
-        }
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())
+        let bytes = crate::hunspell::read_capped(&path)?;
+        String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", path.display()))
     };
     match read() {
         Ok(text) => parse(&text),
         Err(e) => {
-            log::warn!("Hungarian hyphenation: {}: {e}", path.display());
+            log::warn!("Hungarian hyphenation: {e}");
             Patterns::default()
         }
     }
