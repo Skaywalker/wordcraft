@@ -598,6 +598,30 @@ fn a_player_that_loses_the_browser_speech_pauses() {
 }
 
 #[test]
+fn a_player_waiting_to_speak_its_next_sentence_is_told_it_lost_the_speech() {
+    // The reading player's next sentence waits for its timer after a cancel (nothing is being
+    // spoken): another player that starts reading still finds it as the owner and pauses it.
+    let mut reading = ReadAloud::default();
+    reading.backend = Backend::Hold;
+    reading.start(sentences(&Document::from_text("One. Two."), &Pos::body(0, 0), None, true));
+    let mut other = ReadAloud::default();
+    other.backend = Backend::Hold;
+    other.start(sentences(&Document::from_text("Three."), &Pos::body(0, 0), None, true));
+    let owner = speech_owner(None, Some(Arc::downgrade(&reading.shared)));
+    assert!(may_cancel(owner.as_ref(), &other.shared, true));
+    if let Some(lost) = owner.and_then(|o| o.upgrade()).filter(|o| !Arc::ptr_eq(o, &other.shared)) {
+        speech_taken_over(&lost);
+    }
+    assert_eq!(reading.state(), State::Paused);
+    assert_eq!(other.state(), State::Playing);
+    // The utterance being spoken wins over a waiting one.
+    let spoken = speech_owner(Some(Arc::downgrade(&other.shared)), Some(Arc::downgrade(&reading.shared)));
+    assert!(spoken.is_some_and(|o| std::sync::Weak::ptr_eq(&o, &Arc::downgrade(&other.shared))));
+    reading.stop();
+    other.stop();
+}
+
+#[test]
 fn the_browser_gets_a_bounded_time_per_sentence() {
     assert_eq!(web_sentence_limit_ms(0, 1.0), 30_000.0);
     assert_eq!(web_sentence_limit_ms(600, 1.0), 270_000.0);

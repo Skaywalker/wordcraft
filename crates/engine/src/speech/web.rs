@@ -18,8 +18,8 @@ use wasm_bindgen::closure::Closure;
 use web_sys::{SpeechSynthesis, SpeechSynthesisUtterance, SpeechSynthesisVoice};
 
 use super::{
-    Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, ask_browser_voices_again, lock, may_cancel, plain_tag, speech_taken_over, voice_for,
-    web_retry, web_sentence_limit_ms,
+    Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, ask_browser_voices_again, lock, may_cancel, plain_tag, speech_owner, speech_taken_over,
+    voice_for, web_retry, web_sentence_limit_ms,
 };
 
 type Handler = Closure<dyn FnMut(web_sys::Event)>;
@@ -45,8 +45,9 @@ struct Voices {
 
 thread_local! {
     static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
-    /// A sentence waiting to be spoken once the browser has handled a cancel, and its timer.
-    static DEFERRED: RefCell<Option<(i32, Timer)>> = const { RefCell::new(None) };
+    /// A sentence waiting to be spoken once the browser has handled a cancel: its timer, and the
+    /// player it is for.
+    static DEFERRED: RefCell<Option<(i32, Timer, Weak<Player>)>> = const { RefCell::new(None) };
     /// Closures replaced while they may still be running (a handler that ends a sentence starts
     /// the next one): kept until later replacements push them out.
     static RETIRED_HANDLERS: RefCell<Vec<Handler>> = const { RefCell::new(Vec::new()) };
@@ -103,7 +104,7 @@ fn after(ms: f64, f: impl FnMut() + 'static) -> Option<(i32, Timer)> {
 /// whether the browser was told to cancel: only when it had something to cancel, since Chrome and
 /// Safari can drop an utterance spoken right after a cancel.
 fn cancel() -> bool {
-    if let Some((id, t)) = DEFERRED.with(|d| d.borrow_mut().take()) {
+    if let Some((id, t, _)) = DEFERRED.with(|d| d.borrow_mut().take()) {
         retire_timer(id, t);
     }
     if let Some(c) = CURRENT.with(|c| c.borrow_mut().take()) {
@@ -123,9 +124,12 @@ fn cancel() -> bool {
     }
 }
 
-/// The owner of the sentence being spoken.
+/// The owner of the browser's speech: the player whose sentence is being spoken, or whose next
+/// sentence waits to be spoken after a cancel.
 fn owner() -> Option<Weak<Player>> {
-    CURRENT.with(|c| c.borrow().as_ref().map(|c| c.player.clone()))
+    let current = CURRENT.with(|c| c.borrow().as_ref().map(|c| c.player.clone()));
+    let deferred = DEFERRED.with(|d| d.borrow().as_ref().map(|d| d.2.clone()));
+    speech_owner(current, deferred)
 }
 
 /// [`cancel`], when the sentence being spoken is `player`'s: another player going away (the
@@ -211,14 +215,14 @@ fn speak(shared: &Arc<Player>, attempt: WebAttempt) {
     let player = Arc::downgrade(shared);
     let later = after(0.0, move || {
         if let Some(p) = player.upgrade() {
-            if let Some((id, t)) = DEFERRED.with(|d| d.borrow_mut().take()) {
+            if let Some((id, t, _)) = DEFERRED.with(|d| d.borrow_mut().take()) {
                 retire_timer(id, t);
             }
             speak_now(&p, attempt);
         }
     });
     match later {
-        Some(later) => DEFERRED.with(|d| *d.borrow_mut() = Some(later)),
+        Some((id, t)) => DEFERRED.with(|d| *d.borrow_mut() = Some((id, t, Arc::downgrade(shared)))),
         None => speak_now(shared, attempt),
     }
 }

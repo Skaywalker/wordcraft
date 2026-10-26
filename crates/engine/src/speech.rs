@@ -847,6 +847,13 @@ fn web_retry(code: &str, attempt: WebAttempt, tailored: bool) -> WebRetry {
     }
 }
 
+/// The owner of the browser's speech: the player of the sentence being spoken (`current`), or
+/// else the one whose next sentence waits to be spoken after a cancel (`deferred`).
+#[cfg(any(target_arch = "wasm32", test))]
+fn speech_owner<T>(current: Option<std::sync::Weak<T>>, deferred: Option<std::sync::Weak<T>>) -> Option<std::sync::Weak<T>> {
+    current.or(deferred)
+}
+
 /// Another player took the browser's speech over from `player`: a reading pauses on its sentence
 /// (Play carries on from it) rather than staying Playing with nothing spoken.
 #[cfg(any(target_arch = "wasm32", test))]
