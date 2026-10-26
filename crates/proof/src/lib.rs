@@ -461,6 +461,7 @@ fn dictionary_loaded(lang: ProofLang) -> Option<bool> {
         ProofLang::Cs => cs::has_dictionary(),
         ProofLang::Id => id::has_dictionary(),
         l if l.is_spanish() => es::has_dictionary(l),
+        ProofLang::Hu => hu::has_dictionary(),
         _ => return None,
     })
 }
@@ -479,6 +480,7 @@ fn dictionary_needed(lang: ProofLang, installed: bool) -> Option<&'static str> {
         ProofLang::Cs => Some("cs_CZ"),
         ProofLang::Id => Some("id_ID"),
         l if l.is_spanish() => Some(es::dictionary_name(l)),
+        ProofLang::Hu => Some(hu::NAMES[0]),
         _ => None,
     }
 }
@@ -1062,6 +1064,7 @@ mod tests {
             (ProofLang::EsMx, "es_MX"),
             (ProofLang::Es419, "es_419"),
             (ProofLang::EsUy, "es_UY"),
+            (ProofLang::Hu, "hu_HU"),
         ] {
             assert_eq!(dictionary_needed(l, false), Some(name), "{l:?}");
             assert_eq!(dictionary_needed(l, true), None, "{l:?}");
