@@ -46,7 +46,7 @@ SFX R 0 -ban .
 ";
 
 /// Stems (the count line first, as in Hunspell files).
-pub const DIC: &str = "59
+pub const DIC: &str = "62
 ház/YA
 alma/YA
 fa/YA
@@ -103,6 +103,9 @@ pl.
 stb.
 Kft./R
 érk.
+ék
+ék.
+Charles
 ócska/!A
 kertész/YO
 ";

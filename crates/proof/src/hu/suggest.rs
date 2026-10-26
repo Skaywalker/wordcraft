@@ -45,6 +45,9 @@ const COMPOUND_CHECKS: usize = 120;
 /// Candidates checked as compounds in round 2, which may try thousands of accent spellings
 /// (`gyumolcsoskosarban` → `gyümölcsöskosárban` is found after hundreds); most fail at once.
 const ACCENT_COMPOUND_CHECKS: usize = 1000;
+/// Part lookups for all the compound checks of one call: most checks fail after a few, so this
+/// bounds the rare garbage word whose every check runs long.
+const PART_LOOKUPS: u32 = 200_000;
 /// A suggestion that is a word only as a compound ranks after a plain word at the same cost.
 const COST_COMPOUND: u32 = 3;
 
@@ -70,6 +73,8 @@ struct Collector<'a> {
     seq: usize,
     /// Compound checks left in this round ([`COMPOUND_CHECKS`]).
     compound_checks: usize,
+    /// Part lookups left for all the compound checks of the call ([`PART_LOOKUPS`]).
+    part_lookups: u32,
 }
 
 impl Collector<'_> {
@@ -84,9 +89,9 @@ impl Collector<'_> {
         for part in cand.split(' ') {
             if self.d.contains_simple_suggestible(part) {
                 words.push(part.to_string());
-            } else if self.compound_checks > 0 && {
+            } else if self.compound_checks > 0 && self.part_lookups > 0 && {
                 self.compound_checks -= 1;
-                self.d.contains_suggestible(part)
+                self.d.contains_suggestible_within(part, &mut self.part_lookups)
             } {
                 words.push(part.to_string());
                 cost += COST_COMPOUND;
@@ -218,8 +223,15 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     let case = casing(word);
     let input = word.to_lowercase();
     let chars: Vec<char> = input.chars().collect();
-    let mut col =
-        Collector { d, input: input.clone(), tested: HashSet::new(), found: HashMap::new(), seq: 0, compound_checks: ACCENT_COMPOUND_CHECKS };
+    let mut col = Collector {
+        d,
+        input: input.clone(),
+        tested: HashSet::new(),
+        found: HashMap::new(),
+        seq: 0,
+        compound_checks: ACCENT_COMPOUND_CHECKS,
+        part_lookups: PART_LOOKUPS,
+    };
     // 1. Letter case.
     if d.contains_suggestible(&input) && word != input {
         col.keep(input.clone(), COST_CASE);
@@ -440,6 +452,18 @@ mod tests {
             assert!(!s.iter().any(|x| x.to_lowercase().contains("ócska") || x == "kertész"), "{w} → {s:?}");
         }
         crate::affix::tests::assert_nosuggest_is_honoured(suggest_in);
+    }
+
+    #[test]
+    fn a_long_garbage_word_ends_quickly() {
+        // Hundreds of accent variants of a vowel-heavy word, each a compound check: the part
+        // lookups of the whole call are bounded.
+        crate::hu::test_dict::install();
+        let _ = suggest("ház", 1);
+        let t = std::time::Instant::now();
+        let _ = suggest("aouaouaouaouaouaouaouaouaouaouaouaouaou", 6);
+        let _ = suggest("ouououououououououououououououououououo", 6);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
     }
 
     #[test]

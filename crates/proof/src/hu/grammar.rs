@@ -259,10 +259,12 @@ fn abbreviation_or_number(prev: &str) -> bool {
         || listed_abbreviation(prev)
 }
 
-/// Does the loaded dictionary list `prev` with a period (`érk.`, `ény.`)?
+/// Does the loaded dictionary list `prev` with a period (`érk.`, `ény.`) while the bare form is
+/// no word of its own (`ék.` may end a sentence about an `ék`)?
 fn listed_abbreviation(prev: &str) -> bool {
     let d = super::dictionary();
-    !d.is_empty() && d.contains_simple(&format!("{}.", prev.to_lowercase()))
+    let lower = prev.to_lowercase();
+    !d.is_empty() && d.contains_simple(&format!("{lower}.")) && !d.check(&lower)
 }
 
 const CLOSING: [char; 8] = ['"', '”', '’', '\'', ')', '»', ']', '\u{1}'];
@@ -301,24 +303,20 @@ fn sentence_capitals(text: &str, ws: &[(usize, usize)], capital_first: bool, v: 
     }
 }
 
-/// Is the word before `ws[k]` a name, so `de` is a name particle (`Charles de Gaulle`, `Jean de
-/// la Fontaine`)? It is capitalized and either inside the sentence or, at its start, no word in
-/// lower case (`Szép de drága`: `szép` is one, so that `de` takes a comma).
+/// Is `de` at `ws[k]` a name particle (`Charles de Gaulle`, `Jean de la Fontaine`)? A
+/// capitalized name stands before it and a capitalized word (or `la`, `le`, `los`, `las`) after
+/// it, and the word before is a name the dictionary lists as written, or one it doesn't know: an
+/// inflected or common word (`Budapesten de Péter`, `Szép de Anna`) takes a comma. Without a
+/// dictionary the capitals decide.
 fn name_before(text: &str, ws: &[(usize, usize)], k: usize) -> bool {
-    let Some(&(pa, pb)) = k.checked_sub(1).and_then(|i| ws.get(i)) else { return false };
-    let Some(prev) = text.get(pa..pb) else { return false };
-    if !prev.chars().next().is_some_and(char::is_uppercase) {
+    let word = |i: Option<usize>| i.and_then(|i| ws.get(i)).and_then(|&(s, e)| text.get(s..e));
+    let (Some(prev), Some(next)) = (word(k.checked_sub(1)), word(k.checked_add(1))) else { return false };
+    let capital = |w: &str| w.chars().next().is_some_and(char::is_uppercase);
+    if !capital(prev) || !(capital(next) || matches!(next, "la" | "le" | "los" | "las")) {
         return false;
     }
-    let sentence_start = match k.checked_sub(2).and_then(|i| ws.get(i)) {
-        None => true,
-        Some(&(qa, qb)) => ends_sentence(text.get(qb..pa).unwrap_or(""), text.get(qa..qb).unwrap_or("")),
-    };
-    if !sentence_start {
-        return true;
-    }
     let d = super::dictionary();
-    !d.is_empty() && !d.check(&prev.to_lowercase())
+    d.is_empty() || d.is_listed(prev) || !d.check(prev)
 }
 
 /// Is `w` (lower case) a form of a relative pronoun: a stem, optionally its plural, and a case
@@ -481,9 +479,11 @@ mod tests {
         clean("Vettem gyümölcsöt, pl. almát, körtét stb. és zöldséget.");
         clean("Kb. tíz perc múlva, ill. fél óra múlva jön.");
         clean("Dr. Kovács és ifj. Nagy János a 3. fejezetet olvasta.");
-        // An abbreviation the dictionary lists with its period.
+        // An abbreviation the dictionary lists with its period, unless the bare form is a word of
+        // its own (`ék.` ends the sentence).
         crate::hu::test_dict::install();
         clean("Az érk. dátuma.");
+        assert!(messages("Ez egy ék. az másik.").iter().any(|m| m.starts_with("A mondat nagybetűvel")));
         clean("A rendezvény 2026. október 15. napján lesz.");
         clean("Vártam... aztán végre megjött.");
         clean("– Tényleg? – kérdezte. – Igen – felelte.");
@@ -523,14 +523,18 @@ mod tests {
         for want in ["„de”", "„amelyben”", "„amellyel”", "„akikkel”"] {
             assert!(m.iter().any(|x| x.contains(want)), "{want}: {m:?}");
         }
-        // A capitalized word before `de` makes it a name particle inside a sentence, or at its
-        // start when the word isn't a common one; `amelynél` and `akinél` are relative pronouns.
+        // `de` is a name particle between a name and a capital (or `la`): not after a Hungarian
+        // word, inflected names included; `amelynél` and `akinél` are relative pronouns.
         crate::hu::test_dict::install();
-        clean("Ezt Jean de la Fontaine írta.");
+        // `Charles` is listed as written, `Jean` unknown: both are names.
+        clean("Ezt Jean de la Fontaine írta. Charles de Gaulle beszélt.");
         clean("Jean de la Fontaine írta.");
         let m = messages("Szép de Anna nem jött el. Ez az amelynél jobb nincs. Az akinél van.");
         for want in ["„de”", "„amelynél”", "„akinél”"] {
             assert!(m.iter().any(|x| x.contains(want)), "{want}: {m:?}");
+        }
+        for t in ["Voltam Budapesten de nem tetszett.", "Elmentem a Tescóba de zárva volt.", "Láttam Budapesten de Péter nem."] {
+            assert!(messages(t).iter().any(|x| x.contains("„de”")), "{t}");
         }
     }
 

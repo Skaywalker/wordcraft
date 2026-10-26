@@ -1218,11 +1218,26 @@ impl AffixDict {
         self.is_word(&self.normalize(w), self.no_suggest | self.substandard)
     }
 
+    /// [`AffixDict::contains_suggestible`] whose compound search spends at most one search's
+    /// worth of `budget` part lookups (callers bound the total of many checks this way).
+    pub fn contains_suggestible_within(&self, w: &str, budget: &mut u32) -> bool {
+        let given = compound::PART_BUDGET.min(*budget);
+        let mut left = given;
+        let found = self.is_word_in(&self.normalize(w), self.no_suggest | self.substandard, &mut left);
+        *budget -= given - left;
+        found
+    }
+
     /// Is `w` exactly (case and all) a stem or an affixed form of one, leaving compounds aside?
     /// Much cheaper than [`AffixDict::contains`] for a dictionary that compounds, so suggestions
     /// try it first.
     pub fn contains_simple(&self, w: &str) -> bool {
         self.simple_except(w, Mask::EMPTY)
+    }
+
+    /// Is `w` listed as a stem exactly as written (`Charles`, not `Budapesten` or `Szép`)?
+    pub fn is_listed(&self, w: &str) -> bool {
+        self.stem_mask(&self.normalize(w)).is_some_and(|m| !m.meets(self.forbidden))
     }
 
     /// May forms of the stem `stem` be suggested: not `FORBIDDENWORD`, `NOSUGGEST`, `SUBSTANDARD`

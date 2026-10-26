@@ -749,10 +749,15 @@ pub(crate) fn is_address(token: &str) -> bool {
 fn spelling_issue(text: &str, a: usize, b: usize, lang: ProofLang, opts: &Options, internet: bool) -> Option<Issue> {
     let w = text.get(a..b)?;
     // A Hungarian abbreviation is listed with its period (`pl.`, `stb.`), which isn't part of the
-    // word, and takes its endings after a hyphen (`Kft.-ben`): the whole is checked.
-    let checked = if lang == ProofLang::Hu { hu::spelling_span(text, a, b).and_then(|(s, e)| text.get(s..e)).unwrap_or(w) } else { w };
+    // word, and takes its endings after a hyphen (`Kft.-ben`): those spans are checked.
+    let spans = if lang == ProofLang::Hu { hu::spelling_spans(text, a, b) } else { Vec::new() };
+    let correct = if spans.is_empty() {
+        is_correct_in_with(w, lang, opts)
+    } else {
+        spans.iter().filter_map(|&(s, e)| text.get(s..e)).any(|t| is_correct_in_with(t, lang, opts))
+    };
     // A word with a Vietnamese-only letter (a name like Nguyễn in English text) isn't English.
-    if (opts.ignore_internet && internet) || (lang.is_english() && vi::is_vietnamese_word(w)) || is_correct_in_with(checked, lang, opts) {
+    if (opts.ignore_internet && internet) || (lang.is_english() && vi::is_vietnamese_word(w)) || correct {
         return None;
     }
     let message = match lang {

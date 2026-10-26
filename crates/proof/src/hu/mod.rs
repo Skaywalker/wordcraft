@@ -99,24 +99,32 @@ fn is_latin_letter(c: char) -> bool {
     c.is_alphabetic() && (c < '\u{0250}' || ('\u{1E00}'..='\u{1EFF}').contains(&c))
 }
 
-/// The text the word at `a..b` of `text` is checked as: with the period that follows it (`pl.`,
-/// an abbreviation the dictionary may list with it), and with a hyphenated ending after that
-/// period (`Kft.-ben`, `szept.-ben`), or — for the ending itself — from the abbreviation before
-/// it. `None`: the word alone.
-pub(crate) fn spelling_span(text: &str, a: usize, b: usize) -> Option<(usize, usize)> {
+/// The texts the word at `a..b` of `text` is checked as, any of which may be correct; empty: the
+/// word alone. An ending after an abbreviation (`ben` in `Kft.-ben.`) is checked with the
+/// abbreviation, so a wrong ending is marked alone. The abbreviation is checked with its ending
+/// or else with its period alone (`Kft.` in `Kft.-bem` is right); a word before a period with it
+/// (`pl.`, an abbreviation the dictionary may list with it).
+pub(crate) fn spelling_spans(text: &str, a: usize, b: usize) -> Vec<(usize, usize)> {
     let is_w = |c: char| c.is_alphanumeric();
     let word_end = |from: usize| text.get(from..).map(|r| from + r.find(|c: char| !is_w(c)).unwrap_or(r.len()));
-    if text.get(b..)?.starts_with(".-") {
-        let end = word_end(b + 2)?;
-        return Some((a, if end > b + 2 { end } else { b + 1 }));
-    }
-    if text.get(b..)?.starts_with('.') {
-        return Some((a, b + 1));
-    }
     // The ending after an abbreviation: `ben` in `Kft.-ben`.
-    let before = text.get(..a)?.strip_suffix(".-")?;
-    let start = before.rfind(|c: char| !is_w(c)).map_or(0, |i| i + before.get(i..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8));
-    (start < before.len()).then_some((start, b))
+    if let Some(before) = text.get(..a).and_then(|t| t.strip_suffix(".-")) {
+        let start = before.rfind(|c: char| !is_w(c)).map_or(0, |i| i + before.get(i..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8));
+        if start < before.len() {
+            return vec![(start, b)];
+        }
+    }
+    let rest = text.get(b..).unwrap_or("");
+    let mut out = Vec::new();
+    if rest.starts_with(".-")
+        && let Some(end) = word_end(b + 2).filter(|&e| e > b + 2)
+    {
+        out.push((a, end));
+    }
+    if rest.starts_with('.') {
+        out.push((a, b + 1));
+    }
+    out
 }
 
 /// Is `word` spelled correctly in Hungarian? Numbers and words with digits (`2026-ban` follows
@@ -240,11 +248,17 @@ mod tests {
         let text = "A Kft-ban szép ház.";
         let issues = crate::check_spelling_in(text, crate::ProofLang::Hu);
         assert!(!issues.is_empty());
-        assert_eq!(spelling_span("Kft.-ban x", 0, 3), Some((0, 8)));
-        assert_eq!(spelling_span("Kft.-ban x", 5, 8), Some((0, 8)));
-        assert_eq!(spelling_span("pl. x", 0, 2), Some((0, 3)));
-        assert_eq!(spelling_span("Kft.- x", 0, 3), Some((0, 4)));
-        assert_eq!(spelling_span("ház x", 0, 4), None);
+        assert_eq!(spelling_spans("Kft.-ban x", 0, 3), [(0, 8), (0, 4)]);
+        assert_eq!(spelling_spans("Kft.-ban x", 5, 8), [(0, 8)]);
+        assert_eq!(spelling_spans("Kft.-ban.", 5, 8), [(0, 8)], "the sentence's period isn't the ending's");
+        assert_eq!(spelling_spans("pl. x", 0, 2), [(0, 3)]);
+        assert_eq!(spelling_spans("Kft.- x", 0, 3), [(0, 4)]);
+        assert!(spelling_spans("ház x", 0, 4).is_empty());
+        // At the end of a sentence, and with a wrong ending only the ending is marked.
+        assert!(crate::check_spelling_in("Szép ház a Kft.-ban.", crate::ProofLang::Hu).is_empty());
+        let text = "A Kft.-bam szép.";
+        let marked: Vec<&str> = crate::check_spelling_in(text, crate::ProofLang::Hu).iter().map(|i| &text[i.start..i.end]).collect();
+        assert_eq!(marked, ["bam"]);
     }
 
     #[test]
