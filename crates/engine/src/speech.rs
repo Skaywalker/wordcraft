@@ -420,7 +420,7 @@ fn speak_dispatcher(text: &str, lang: Option<&str>, rate: f32, changed: &dyn Fn(
 /// Why reading paused when another program cancelled or paused the sentence.
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 const HALTED_BY_OTHER: &str =
-    "Speech Dispatcher stopped the sentence for another program (a screen reader, or a stop for every program): press Play to go on";
+    "Speech Dispatcher kept stopping the sentence for another program (a screen reader, or a stop for every program): press Play to go on";
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 thread_local! {
@@ -616,6 +616,10 @@ struct Shared {
     /// A worker thread is running (cleared under the lock as it exits).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     running: bool,
+    /// Bumped when a reading starts: a worker thread can outlive a reading (a pause, then a new
+    /// Read Aloud), and what it learnt about the system's speech programs is per reading.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    readings: u64,
 }
 
 /// The Read Aloud player.
@@ -636,7 +640,16 @@ impl Default for ReadAloud {
         let off = cfg!(test) || std::env::var("WORDCRAFT_SPEECH").is_ok_and(|v| v == "off");
         ReadAloud {
             shared: Arc::new((
-                Mutex::new(Shared { queue: Vec::new(), index: 0, state: State::Stopped, rate: 1.0, generation: 0, error: None, running: false }),
+                Mutex::new(Shared {
+                    queue: Vec::new(),
+                    index: 0,
+                    state: State::Stopped,
+                    rate: 1.0,
+                    generation: 0,
+                    error: None,
+                    running: false,
+                    readings: 0,
+                }),
                 Condvar::new(),
             )),
             backend: if off { Backend::Hold } else { Backend::System },
@@ -672,6 +685,7 @@ impl ReadAloud {
             s.queue = queue;
             s.index = 0;
             s.error = None;
+            s.readings = s.readings.wrapping_add(1);
         });
     }
 
@@ -808,8 +822,9 @@ enum Spoken {
 #[cfg(not(target_arch = "wasm32"))]
 fn worker(shared: &(Mutex<Shared>, Condvar), backend: Backend) {
     let (m, cv) = shared;
+    let mut reading = None;
     loop {
-        let (text, lang, generation, rate) = {
+        let (text, lang, generation, rate, readings) = {
             let mut s = lock(m);
             while s.state == State::Paused {
                 s = cv.wait(s).unwrap_or_else(PoisonError::into_inner);
@@ -819,7 +834,7 @@ fn worker(shared: &(Mutex<Shared>, Condvar), backend: Backend) {
                 return;
             }
             match s.queue.get(s.index) {
-                Some(u) => (u.text.clone(), u.lang.clone(), s.generation, s.rate),
+                Some(u) => (u.text.clone(), u.lang.clone(), s.generation, s.rate, s.readings),
                 None => {
                     s.state = State::Stopped;
                     s.running = false;
@@ -827,6 +842,12 @@ fn worker(shared: &(Mutex<Shared>, Condvar), backend: Backend) {
                 }
             }
         };
+        // A new reading asks the system afresh which speech programs it has.
+        if reading != Some(readings) {
+            reading = Some(readings);
+            #[cfg(all(unix, not(target_os = "macos")))]
+            NO_ESPEAK.set(false);
+        }
         let changed = || lock(m).generation != generation;
         let outcome = match backend {
             Backend::System => speak(&text, lang.as_deref(), rate, &changed),
