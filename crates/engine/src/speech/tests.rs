@@ -206,6 +206,24 @@ fn every_reading_counts_as_a_new_one() {
 }
 
 #[test]
+fn play_after_a_failed_sentence_plays_it_again() {
+    // A sentence whose end never came stops reading with an error (as the worker does on a
+    // timeout); Play starts it again and the message goes.
+    let mut r = ReadAloud::default();
+    r.backend = Backend::Hold;
+    r.start(sentences(&Document::from_text("One. Two."), &Pos::body(0, 0), None, true));
+    r.skip(1);
+    {
+        let mut s = lock(&r.shared.0);
+        s.state = State::Stopped;
+        s.error = Some("Read Aloud couldn't use Speech Dispatcher: the sentence didn't end".into());
+    }
+    r.play_pause();
+    assert_eq!((r.state(), r.progress().0, r.error()), (State::Playing, 1, None));
+    r.stop();
+}
+
+#[test]
 fn play_after_a_halt_carries_on_and_clears_the_message() {
     // Another program stopped the sentence: reading paused on it with a message, and Play
     // goes on from the same sentence.
