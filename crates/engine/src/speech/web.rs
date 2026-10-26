@@ -18,8 +18,8 @@ use wasm_bindgen::closure::Closure;
 use web_sys::{SpeechSynthesis, SpeechSynthesisUtterance, SpeechSynthesisVoice};
 
 use super::{
-    Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, lock, may_cancel, plain_tag, speech_taken_over, voice_for, web_retry,
-    web_sentence_limit_ms,
+    Shared, State, Voice, VoiceKind, WebAttempt, WebRetry, ask_browser_voices_again, lock, may_cancel, plain_tag, speech_taken_over, voice_for,
+    web_retry, web_sentence_limit_ms,
 };
 
 type Handler = Closure<dyn FnMut(web_sys::Event)>;
@@ -59,8 +59,6 @@ thread_local! {
 
 /// How many replaced closures are kept alive.
 const RETIRED_KEPT: usize = 4;
-/// An empty voice list is asked for again at most this often (ms).
-const EMPTY_VOICES_AGAIN_MS: f64 = 1000.0;
 
 /// What Read Aloud says when the browser has no speech synthesis.
 const UNAVAILABLE: &str = "Read Aloud isn't available in this browser";
@@ -145,7 +143,7 @@ pub(super) fn voices() -> (Arc<[Voice]>, f64) {
     let now = js_sys::Date::now();
     let first = FIRST_ASKED.with(|f| *f.borrow_mut().get_or_insert(now));
     let fresh =
-        VOICES.with(|v| v.borrow().as_ref().filter(|v| !v.listed.is_empty() || now - v.asked < EMPTY_VOICES_AGAIN_MS).map(|v| Arc::clone(&v.listed)));
+        VOICES.with(|v| v.borrow().as_ref().filter(|v| !ask_browser_voices_again(v.listed.is_empty(), now - v.asked)).map(|v| Arc::clone(&v.listed)));
     if let Some(listed) = fresh {
         return (listed, now - first);
     }

@@ -769,7 +769,7 @@ fn installed_voices() -> Option<Arc<[Voice]>> {
     {
         // Browsers load their voices after the page: an empty list is pending for a while.
         let (list, waited) = web::voices();
-        (!list.is_empty() || !web_voices_pending(waited)).then_some(list)
+        web_voice_list(list, waited)
     }
 }
 
@@ -782,6 +782,26 @@ const WEB_VOICES_WAIT_MS: f64 = 5000.0;
 fn web_voices_pending(waited_ms: f64) -> bool {
     waited_ms < WEB_VOICES_WAIT_MS
 }
+
+/// The browser's voice list as the player reports it, `waited_ms` after it was first asked for:
+/// `None` (pending) while it is empty and the browser may still be loading its voices, then the
+/// list as it is. Nothing is kept from an empty answer, so voices that arrive later still show.
+#[cfg(any(target_arch = "wasm32", test))]
+fn web_voice_list(list: Arc<[Voice]>, waited_ms: f64) -> Option<Arc<[Voice]>> {
+    (!list.is_empty() || !web_voices_pending(waited_ms)).then_some(list)
+}
+
+/// Is a cached browser voice list to be asked for again, `since_ms` after it was asked? An empty
+/// one after [`WEB_EMPTY_VOICES_AGAIN_MS`] (not on every repaint), one with voices only when the
+/// browser says they changed.
+#[cfg(any(target_arch = "wasm32", test))]
+fn ask_browser_voices_again(empty: bool, since_ms: f64) -> bool {
+    empty && (since_ms >= WEB_EMPTY_VOICES_AGAIN_MS || since_ms.is_nan())
+}
+
+/// How often an empty browser voice list is asked for again (ms).
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_EMPTY_VOICES_AGAIN_MS: f64 = 1000.0;
 
 /// How often the browser player says a sentence again that was cancelled from outside it.
 #[cfg(any(target_arch = "wasm32", test))]

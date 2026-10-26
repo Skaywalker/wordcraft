@@ -539,6 +539,24 @@ fn the_browser_player_says_an_interrupted_sentence_again() {
 }
 
 #[test]
+fn delayed_browser_voices_still_arrive_after_an_empty_timeout() {
+    // The browser loads its voices late: the list is pending at first, then empty once the
+    // wait is over, and the voices still show when they arrive, however many repaints asked.
+    let none: Arc<[Voice]> = Arc::new([]);
+    let late: Arc<[Voice]> = vec![Voice { id: "urn:hu".into(), name: "Hungarian".into(), lang: "hu-HU".into(), kind: VoiceKind::Web }].into();
+    for frame in 0..1000 {
+        assert_eq!(web_voice_list(Arc::clone(&none), f64::from(frame)), None, "pending at frame {frame}");
+    }
+    assert_eq!(web_voice_list(Arc::clone(&none), WEB_VOICES_WAIT_MS).as_deref(), Some(&[][..]), "empty after the wait");
+    assert_eq!(web_voice_list(Arc::clone(&late), WEB_VOICES_WAIT_MS * 3.0).as_deref(), Some(&late[..]), "arrived later: shown");
+    // An empty cache is asked again, though not on every repaint; a full one isn't.
+    assert!(!ask_browser_voices_again(true, 10.0));
+    assert!(ask_browser_voices_again(true, WEB_EMPTY_VOICES_AGAIN_MS));
+    assert!(ask_browser_voices_again(true, f64::NAN), "a broken clock never stops asking");
+    assert!(!ask_browser_voices_again(false, 1e9));
+}
+
+#[test]
 fn the_browser_voice_list_waits_a_while_for_its_voices() {
     assert!(web_voices_pending(0.0));
     assert!(web_voices_pending(WEB_VOICES_WAIT_MS - 1.0));
