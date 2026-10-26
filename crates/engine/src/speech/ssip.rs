@@ -690,6 +690,28 @@ mod tests {
     }
 
     #[test]
+    fn a_withheld_end_times_out_and_the_next_sentence_plays() {
+        // The server accepts the sentence, begins it, stays connected and never reports its end:
+        // the wait gives up with an error, drops the message (`CANCEL self`), and closes.
+        let (client, srv) = UnixStream::pair().unwrap();
+        let h = server(srv, Ending::Hold);
+        let req = Request { text: "Withheld.", rate: 0, lang: None };
+        let start = Instant::now();
+        let err = converse(&Stream::Unix(client), &req, &|| false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut, "{err}");
+        assert!(start.elapsed() < SENTENCE_BASE + SENTENCE_PER_CHAR * 9 + REPLY_TIMEOUT * 2, "{:?}", start.elapsed());
+        let got = h.join().unwrap();
+        assert_eq!(speaks(&got), 1);
+        assert!(got.contains(&"CANCEL self".to_string()) && got.last().map(String::as_str) == Some("QUIT"), "{got:?}");
+        // Playback recovers: the next sentence, on a new connection as every sentence gets,
+        // is spoken to its end.
+        let (client, srv) = UnixStream::pair().unwrap();
+        let h = server(srv, Ending::End);
+        assert_eq!(converse(&Stream::Unix(client), &Request { text: "Next.", rate: 0, lang: None }, &|| false).unwrap(), Outcome::Done);
+        assert_eq!(speaks(&h.join().unwrap()), 1);
+    }
+
+    #[test]
     fn a_sentence_that_never_begins_halts_reading_instead_of_failing() {
         // `PAUSE all` before our message began sends no event: the time queued has its own
         // bound, and reaching it halts reading (Play carries on) rather than stopping with an error.
