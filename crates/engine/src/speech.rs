@@ -409,18 +409,30 @@ fn speak_dispatcher(text: &str, lang: Option<&str>, rate: f32, changed: &dyn Fn(
     };
     let lang = dispatcher_language(lang);
     let req = ssip::Request { text, rate: spd_rate(rate), lang: lang.as_deref() };
-    Some(match ssip::converse(&stream, &req, changed) {
+    Some(dispatcher_spoken(ssip::converse(&stream, &req, changed)))
+}
+
+/// How a sentence Speech Dispatcher handled ended, for the worker.
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn dispatcher_spoken(outcome: std::io::Result<ssip::Outcome>) -> Spoken {
+    match outcome {
         Ok(ssip::Outcome::Done) => Spoken::Done,
         Ok(ssip::Outcome::Interrupted) => Spoken::Interrupted,
         Ok(ssip::Outcome::Halted) => Spoken::Halted(HALTED_BY_OTHER.into()),
+        Ok(ssip::Outcome::NotStarted) => Spoken::Halted(NOT_STARTED.into()),
         Err(e) => Spoken::Failed(format!("Read Aloud couldn't use Speech Dispatcher: {e}")),
-    })
+    }
 }
 
 /// Why reading paused when another program cancelled or paused the sentence.
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 const HALTED_BY_OTHER: &str =
     "Speech Dispatcher kept stopping the sentence for another program (a screen reader, or a stop for every program): press Play to go on";
+
+/// Why reading paused when Speech Dispatcher never began the sentence.
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+const NOT_STARTED: &str =
+    "Speech Dispatcher didn't start the sentence (other speech may be queued before it, or its speech module may be stuck): press Play to try again";
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 thread_local! {
