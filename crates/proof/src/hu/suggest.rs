@@ -10,7 +10,8 @@
 //! 3. the dictionary's `REP` table of common confusions (`hejesírás` → `helyesírás`: `j`/`ly`);
 //! 4. a missing space (`nemis` → `nem is`, `ésis` → `és is`), cheaper when one half is a short
 //!    function word;
-//! 5. one typo: a letter left out, added, swapped with the next or mistyped (`TRY` letters);
+//! 5. one typo: a letter left out, added, swapped with the next or mistyped (`TRY` letters),
+//!    read as compounds only when no round found a plain word, as Hunspell does;
 //! 6. when that finds nothing: the stems that start like the word (accents folded) and share the
 //!    most letter pairs with it, whose forms are ranked by an edit distance in which an accent slip
 //!    costs half (two typos at most).
@@ -39,15 +40,23 @@ const MAX_MAP_CHANGES: usize = 4;
 const MAX_MAP_VARIANTS: usize = 4096;
 /// Stems the scan of round 6 expands.
 const SCAN_STEMS: usize = 48;
-/// Candidates checked as compounds in rounds 3 to 5: a compound search costs far more than a
+/// Candidates checked as compounds in rounds 3 and 4: a compound search costs far more than a
 /// plain lookup.
 const COMPOUND_CHECKS: usize = 120;
+/// Candidates checked as compounds in round 5, when it found no plain word: every typo of a word
+/// of [`MAX_LETTERS`] letters (`gyümölcsöskosárbam` → `gyümölcsöskosárban` is a late one), the
+/// work bounded by [`ROUND_PART_LOOKUPS`].
+const TYPO_COMPOUND_CHECKS: usize = 3000;
 /// Candidates checked as compounds in round 2, which may try thousands of accent spellings
 /// (`gyumolcsoskosarban` → `gyümölcsöskosárban` is found after hundreds); most fail at once.
 const ACCENT_COMPOUND_CHECKS: usize = 1000;
-/// Part lookups for all the compound checks of one call: most checks fail after a few, so this
+/// Part lookups for the compound checks of round 2: most checks fail after a few, so this
 /// bounds the rare garbage word whose every check runs long.
-const PART_LOOKUPS: u32 = 200_000;
+const ACCENT_PART_LOOKUPS: u32 = 200_000;
+/// Part lookups for the compound checks of each of rounds 3 to 5, so round 2 can't use them up
+/// (`gyümölcsöskosárbam` → `gyümölcsöskosárban` comes from round 5). A call spends at most
+/// [`ACCENT_PART_LOOKUPS`] and three times this.
+const ROUND_PART_LOOKUPS: u32 = 200_000;
 /// A suggestion that is a word only as a compound ranks after a plain word at the same cost.
 const COST_COMPOUND: u32 = 3;
 
@@ -73,8 +82,11 @@ struct Collector<'a> {
     seq: usize,
     /// Compound checks left in this round ([`COMPOUND_CHECKS`]).
     compound_checks: usize,
-    /// Part lookups left for all the compound checks of the call ([`PART_LOOKUPS`]).
+    /// Part lookups left for the compound checks of this round ([`ACCENT_PART_LOOKUPS`],
+    /// [`ROUND_PART_LOOKUPS`]).
     part_lookups: u32,
+    /// Suggestions kept that are plain words (no compound reading).
+    plain: usize,
 }
 
 impl Collector<'_> {
@@ -86,15 +98,23 @@ impl Collector<'_> {
         }
         let mut words = Vec::new();
         let mut cost = cost;
+        let mut compound = false;
         for part in cand.split(' ') {
             if self.d.contains_simple_suggestible(part) {
                 words.push(part.to_string());
-            } else if self.compound_checks > 0 && self.part_lookups > 0 && {
-                self.compound_checks -= 1;
-                self.d.contains_suggestible_within(part, &mut self.part_lookups)
-            } {
+            } else if self.compound_checks == 0 || self.part_lookups == 0 {
+                // No compound check left: the candidate is undecided and may be offered again.
+                let c = capitalize(part);
+                if !self.d.contains_simple_suggestible(&c) {
+                    self.tested.remove(cand);
+                    return;
+                }
+                words.push(c);
+                cost += 1;
+            } else if self.compound_word(part) {
                 words.push(part.to_string());
                 cost += COST_COMPOUND;
+                compound = true;
             } else {
                 // Names don't compound: a capitalized reading is a plain word or nothing.
                 let c = capitalize(part);
@@ -106,7 +126,16 @@ impl Collector<'_> {
                 cost += 1;
             }
         }
+        if !compound {
+            self.plain += 1;
+        }
         self.keep(words.join(" "), cost);
+    }
+
+    /// Spend one compound check on `part`.
+    fn compound_word(&mut self, part: &str) -> bool {
+        self.compound_checks -= 1;
+        self.d.contains_suggestible_within(part, &mut self.part_lookups)
     }
 
     /// Keep a suggestion known to be correct and suggestible (the callers check: [`offer`] with
@@ -230,7 +259,8 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
         found: HashMap::new(),
         seq: 0,
         compound_checks: ACCENT_COMPOUND_CHECKS,
-        part_lookups: PART_LOOKUPS,
+        part_lookups: ACCENT_PART_LOOKUPS,
+        plain: 0,
     };
     // 1. Letter case.
     if d.contains_suggestible(&input) && word != input {
@@ -251,6 +281,7 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     }
     // 3. Common confusions.
     col.compound_checks = COMPOUND_CHECKS;
+    col.part_lookups = ROUND_PART_LOOKUPS;
     for (from, to) in d.rep() {
         if from.is_empty() {
             continue;
@@ -264,6 +295,7 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     // 4. A missing space: cheap after a short leading word or before a short trailing one,
     //    dearer between two longer words, never leaving a stray short half.
     col.compound_checks = COMPOUND_CHECKS;
+    col.part_lookups = ROUND_PART_LOOKUPS;
     for (i, _) in input.char_indices().skip(1) {
         let (Some(a), Some(b)) = (input.get(..i), input.get(i..)) else { continue };
         let long = |p: &str| p.chars().count() >= 3;
@@ -276,8 +308,10 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
         };
         col.offer(&format!("{a} {b}"), cost);
     }
-    // 5. One typo.
-    col.compound_checks = COMPOUND_CHECKS;
+    // 5. One typo, as Hunspell looks for them: plain words first; compound readings only when no
+    //    plain word was found in any round (`orommel` gets `örömmel`, not `orom` + `mell`).
+    col.compound_checks = 0;
+    let mut typos: Vec<(String, u32)> = Vec::new();
     let mut letters: Vec<char> = d.try_chars().chars().filter(|c| c.is_lowercase()).collect();
     if letters.is_empty() {
         letters = "aeoiulznrstkmbhgdáéíóöőúüűvjpfcy".chars().collect();
@@ -287,19 +321,19 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
         if chars.get(i) != chars.get(i + 1) {
             let mut v = chars.clone();
             v.swap(i, i + 1);
-            col.offer(&s(&v), COST_SWAP);
+            typos.push((s(&v), COST_SWAP));
         }
     }
     for i in 0..n {
         let mut v = chars.clone();
         v.remove(i);
-        col.offer(&s(&v), COST_DROP_OR_ADD);
+        typos.push((s(&v), COST_DROP_OR_ADD));
     }
     for i in 0..=n {
         for &c in &letters {
             let mut v = chars.clone();
             v.insert(i, c);
-            col.offer(&s(&v), COST_DROP_OR_ADD);
+            typos.push((s(&v), COST_DROP_OR_ADD));
         }
     }
     for i in 0..n {
@@ -309,8 +343,18 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
                 if let Some(x) = v.get_mut(i) {
                     *x = c;
                 }
-                col.offer(&s(&v), COST_MISTYPE);
+                typos.push((s(&v), COST_MISTYPE));
             }
+        }
+    }
+    for (cand, cost) in &typos {
+        col.offer(cand, *cost);
+    }
+    if col.plain == 0 {
+        col.compound_checks = TYPO_COMPOUND_CHECKS;
+        col.part_lookups = ROUND_PART_LOOKUPS;
+        for (cand, cost) in &typos {
+            col.offer(cand, *cost);
         }
     }
     // 6. Further off: scan the stems that start like the word. A Hungarian stem has thousands
@@ -456,14 +500,22 @@ mod tests {
 
     #[test]
     fn a_long_garbage_word_ends_quickly() {
-        // Hundreds of accent variants of a vowel-heavy word, each a compound check: the part
-        // lookups of the whole call are bounded.
-        crate::hu::test_dict::install();
-        let _ = suggest("ház", 1);
+        // Every accent variant of `aou…x` is a compound check that tries split after split (and
+        // a REP lookup at each boundary) before the `x` fails it: round 2 alone runs a thousand
+        // of them. Each round's part lookups are bounded (this call takes under half of the
+        // time it takes without the bound), and round 5 keeps its own: dropping the `x` still
+        // gives the compound.
+        let d = AffixDict::from_hunspell(
+            "SET UTF-8\nTRY aoux\nMAP 3\nMAP aá\nMAP oó\nMAP uú\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 1\nCHECKCOMPOUNDREP\nREP 6\nREP a á\nREP á a\nREP o ó\nREP ó o\nREP u ú\nREP ú u\n",
+            "9\na/Y\no/Y\nu/Y\ná/Y\nó/Y\nú/Y\nao/Y\nou/Y\nua/Y\n",
+            &[],
+        )
+        .unwrap();
+        let word = format!("{}x", "aou".repeat(8));
         let t = std::time::Instant::now();
-        let _ = suggest("aouaouaouaouaouaouaouaouaouaouaouaouaou", 6);
-        let _ = suggest("ouououououououououououououououououououo", 6);
+        let s = suggest_in(&d, &word, 6);
         assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(s.contains(&"aou".repeat(8)), "{s:?}");
     }
 
     #[test]
