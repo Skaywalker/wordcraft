@@ -591,7 +591,8 @@ fn parse_aff(aff: &str) -> Result<Rules, String> {
     // holds one never matches a stem (stems lose them too), so the rule never applies.
     let resolve = |rules: &mut Vec<RawRule>, r: &Rules| {
         for rule in rules.iter_mut() {
-            rule.4 = r.flags(&rule.4).to_string();
+            // The emoji selector after a flag isn't a flag here either (`SFX S 0 s/☎️ .`).
+            rule.4 = r.flags(&rule.4).chars().filter(|&c| c != EMOJI_SELECTOR).collect();
             rule.3 = r.strip_ignored(&rule.3);
         }
     };
@@ -674,7 +675,7 @@ impl AffixDict {
         // Flags: every one a rule, a rule's continuation classes or a stem uses gets a bit. A flag
         // only an affix carries on (`NEEDAFFIX`, `COMPOUNDPERMITFLAG` on a suffix) counts too.
         let mut flag_chars: Vec<char> = rules.prefixes.iter().chain(&rules.suffixes).map(|r| r.0).collect();
-        flag_chars.extend(rules.prefixes.iter().chain(&rules.suffixes).flat_map(|r| r.4.chars()));
+        flag_chars.extend(rules.prefixes.iter().chain(&rules.suffixes).flat_map(|r| r.4.chars()).filter(|&c| c != EMOJI_SELECTOR));
         flag_chars.extend(stems.iter().flat_map(|s| s.1.chars()));
         flag_chars.sort_unstable();
         flag_chars.dedup();
@@ -1679,6 +1680,11 @@ pub(crate) mod tests {
         assert!(d.contains("telebanco") && d.contains("telebancos"), "the ☎ prefix applies");
         assert!(d.contains("basuras") && !d.contains("telebasura"), "only to stems that carry it");
         assert!(!d.flag_chars.contains(&EMOJI_SELECTOR), "the selector is not a flag");
+        // In a continuation class too: `s/☎️` continues with the ☎ prefix only.
+        let aff = "SET UTF-8\nFLAG UTF-8\nPFX \u{260e}\u{fe0f} Y 1\nPFX \u{260e}\u{fe0f} 0 tele .\nSFX S Y 1\nSFX S 0 s/\u{260e}\u{fe0f} [aeiou]\n";
+        let d = AffixDict::from_hunspell(aff, "1\nbanco/S\n", &[]).unwrap();
+        assert!(d.contains("bancos") && !d.flag_chars.contains(&EMOJI_SELECTOR), "the selector is not a flag");
+        assert!(!AffixDict::from_bytes(&d.to_bytes()).unwrap().flag_chars.contains(&EMOJI_SELECTOR));
     }
 
     #[test]
