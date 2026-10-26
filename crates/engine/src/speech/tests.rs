@@ -187,6 +187,25 @@ fn player_finishes_on_its_own() {
 }
 
 #[test]
+fn every_reading_counts_as_a_new_one() {
+    // The worker forgets what it learnt about the speech programs when a reading starts, even
+    // when the same worker thread carries on (a pause, then Read Aloud again).
+    let mut r = ReadAloud::default();
+    r.backend = Backend::Hold;
+    let readings = |r: &ReadAloud| lock(&r.shared.0).readings;
+    let doc = Document::from_text("One. Two.");
+    r.start(sentences(&doc, &Pos::body(0, 0), None, true));
+    let first = readings(&r);
+    r.play_pause();
+    r.start(sentences(&doc, &Pos::body(0, 0), None, true));
+    assert_eq!(readings(&r), first + 1);
+    r.play_pause();
+    r.play_pause();
+    assert_eq!(readings(&r), first + 1, "pause and play are the same reading");
+    r.stop();
+}
+
+#[test]
 fn play_after_a_halt_carries_on_and_clears_the_message() {
     // Another program stopped the sentence: reading paused on it with a message, and Play
     // goes on from the same sentence.

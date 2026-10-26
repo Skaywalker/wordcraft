@@ -6,9 +6,11 @@
 //! document must never send commands), and stopping cancels only WordCraft's own speech
 //! (`CANCEL self`), where `spd-say -C` would silence every client, a screen reader included.
 //!
-//! One connection speaks one sentence: it names the client, asks for the end, cancel and pause
-//! events, sets the rate and language, sends the text, and waits for the sentence's end event. A
-//! sentence another client cancels or pauses halts reading on it ([`Outcome::Halted`]).
+//! One connection speaks one sentence: it names the client, asks for the begin, end, cancel and
+//! pause events, sets the rate and language, sends the text, and waits for the sentence's end
+//! event. A sentence another client's message cancels (a screen reader's announcement) is sent
+//! again after a pause, twice at most; a sentence cancelled once more, paused by another client,
+//! or never started halts reading on it ([`Outcome::Halted`]).
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -28,10 +30,17 @@ const DEFAULT_PORT: u16 = 6560;
 const START_WAIT: Duration = Duration::from_secs(5);
 /// Longest wait for a TCP connection to one address.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// The end of a sentence is awaited this long, plus [`SENTENCE_PER_CHAR`] for each character: far
-/// more than the slowest reading takes, so only a stuck server or a paused one reaches it.
+/// The end of a sentence is awaited this long after it began, plus [`SENTENCE_PER_CHAR`] for each
+/// character: far more than the slowest reading takes, so only a stuck server reaches it.
 const SENTENCE_BASE: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(30) };
 const SENTENCE_PER_CHAR: Duration = Duration::from_millis(400);
+/// Longest wait for a queued sentence to begin (behind other clients' speech, or paused before it
+/// began, which sends no pause event).
+const QUEUE_WAIT: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(120) };
+/// The pauses before a sentence another client cancelled is sent again: the other client's
+/// message gets time to end, and the server holds ours back while a higher-priority one speaks.
+const RESEND_AFTER: [Duration; 2] =
+    if cfg!(test) { [Duration::from_millis(50), Duration::from_millis(50)] } else { [Duration::from_secs(1), Duration::from_secs(3)] };
 
 /// What to say and how.
 pub(super) struct Request<'a> {
@@ -49,9 +58,8 @@ pub(super) enum Outcome {
     Done,
     /// Reading moved on: the sentence was cancelled.
     Interrupted,
-    /// Another client cancelled or paused it: a screen reader's urgent message, or a stop or pause
-    /// for every client. SSIP doesn't say which, so the sentence isn't sent again (that would
-    /// override a stop and cut the other client off); reading halts on it instead.
+    /// Another client stopped it: cancelled it again after it was sent again, paused it, or kept
+    /// it from beginning. Reading halts on it instead of fighting the other client.
     Halted,
 }
 
@@ -298,7 +306,8 @@ fn moved_on() -> std::io::Error {
     std::io::Error::new(ErrorKind::Interrupted, "reading moved on")
 }
 
-/// The end (702), cancel (703) and pause (704) events.
+/// The begin (701), end (702), cancel (703) and pause (704) events.
+const BEGIN: u16 = 701;
 const END: u16 = 702;
 const CANCEL: u16 = 703;
 const PAUSE: u16 = 704;
@@ -309,6 +318,8 @@ struct Conversation<'a, W, R> {
     lines: Lines<R>,
     /// The last end, cancel or pause event, until it's taken.
     event: Option<u16>,
+    /// The message just queued began.
+    begun: bool,
     /// Whether reading moved on (checked between lines and at every read timeout).
     changed: &'a dyn Fn() -> bool,
 }
@@ -322,6 +333,7 @@ impl<W: Write, R: Read> Conversation<'_, W, R> {
         loop {
             if let Some(line) = self.lines.next()? {
                 match final_code(&line) {
+                    Some(BEGIN) => self.begun = true,
                     Some(code @ (END | CANCEL | PAUSE)) => self.event = Some(code),
                     Some(code) if (700..800).contains(&code) => {}
                     Some(code) => return Ok(code),
@@ -344,32 +356,61 @@ impl<W: Write, R: Read> Conversation<'_, W, R> {
         self.reply()
     }
 
-    /// The end, cancel or pause event of the message just queued, waited for until `limit` has
-    /// passed (a stuck server), or an error as soon as reading moves on.
-    fn event(&mut self, limit: Duration) -> std::io::Result<u16> {
-        let start = Instant::now();
+    /// What became of the message just queued: its end, cancel or pause event, or
+    /// [`Fate::NotStarted`] when it didn't begin within [`QUEUE_WAIT`]. Once it began, its end is
+    /// waited for until `limit` has passed (a stuck server: an error). An error as soon as reading
+    /// moves on.
+    fn fate(&mut self, limit: Duration) -> std::io::Result<Fate> {
+        let queued = Instant::now();
+        let mut began = self.begun.then(Instant::now);
         loop {
-            if let Some(e) = self.event.take() {
-                return Ok(e);
+            match self.event.take() {
+                Some(END) => return Ok(Fate::End),
+                Some(CANCEL) => return Ok(Fate::Cancelled),
+                Some(_) => return Ok(Fate::Paused),
+                None => {}
             }
             if (self.changed)() {
                 return Err(moved_on());
             }
-            if start.elapsed() > limit {
-                return Err(std::io::Error::new(ErrorKind::TimedOut, "the sentence didn't end"));
+            match began {
+                None if queued.elapsed() > QUEUE_WAIT => return Ok(Fate::NotStarted),
+                Some(t) if t.elapsed() > limit => return Err(std::io::Error::new(ErrorKind::TimedOut, "the sentence didn't end")),
+                _ => {}
             }
-            if let Some(line) = self.lines.next()?
-                && let Some(code @ (END | CANCEL | PAUSE)) = final_code(&line)
-            {
-                self.event = Some(code);
+            if let Some(line) = self.lines.next()? {
+                match final_code(&line) {
+                    Some(BEGIN) => {
+                        began.get_or_insert_with(Instant::now);
+                    }
+                    Some(code @ (END | CANCEL | PAUSE)) => self.event = Some(code),
+                    _ => {}
+                }
             }
         }
     }
 
+    /// Wait `pause`, reading what the server sends meanwhile; an error as soon as reading moves on.
+    fn wait(&mut self, pause: Duration) -> std::io::Result<()> {
+        let start = Instant::now();
+        while start.elapsed() < pause {
+            if (self.changed)() {
+                return Err(moved_on());
+            }
+            self.lines.next()?;
+        }
+        Ok(())
+    }
+
     /// Set up the client, say the sentence, and wait for it to end. Only [`converse`] cancels our
-    /// own speech, and it stops waiting first, so a cancel or pause event comes from another client.
+    /// own speech, and it stops waiting first, so a cancel or pause event comes from another
+    /// client. A cancel is most often another client's message, a screen reader's announcement:
+    /// the sentence is sent again after a pause ([`RESEND_AFTER`]), when the announcement has
+    /// ended or the server holds ours back until it has. Cancelled again after that, paused, or
+    /// never begun, the sentence halts reading.
     fn speak(&mut self, req: &Request<'_>) -> std::io::Result<Outcome> {
         ok(self.command("SET SELF CLIENT_NAME user:wordcraft:read-aloud")?)?;
+        ok(self.command("SET SELF NOTIFICATION BEGIN on")?)?;
         ok(self.command("SET SELF NOTIFICATION END on")?)?;
         ok(self.command("SET SELF NOTIFICATION CANCEL on")?)?;
         ok(self.command("SET SELF NOTIFICATION PAUSE on")?)?;
@@ -379,14 +420,33 @@ impl<W: Write, R: Read> Conversation<'_, W, R> {
         if let Some(lang) = req.lang.and_then(super::plain_tag) {
             self.command(&format!("SET SELF LANGUAGE {lang}"))?;
         }
-        self.event = None;
-        ok(self.command("SPEAK")?)?;
-        self.w.write_all(message_data(req.text).as_bytes())?;
-        ok(self.reply()?)?;
         let chars = u32::try_from(req.text.chars().count()).unwrap_or(u32::MAX);
         let limit = SENTENCE_BASE.saturating_add(SENTENCE_PER_CHAR.saturating_mul(chars));
-        Ok(if self.event(limit)? == END { Outcome::Done } else { Outcome::Halted })
+        let mut resends = RESEND_AFTER.iter();
+        loop {
+            self.event = None;
+            self.begun = false;
+            ok(self.command("SPEAK")?)?;
+            self.w.write_all(message_data(req.text).as_bytes())?;
+            ok(self.reply()?)?;
+            match self.fate(limit)? {
+                Fate::End => return Ok(Outcome::Done),
+                Fate::Cancelled => match resends.next() {
+                    Some(pause) => self.wait(*pause)?,
+                    None => return Ok(Outcome::Halted),
+                },
+                Fate::Paused | Fate::NotStarted => return Ok(Outcome::Halted),
+            }
+        }
     }
+}
+
+/// What became of a queued message.
+enum Fate {
+    End,
+    Cancelled,
+    Paused,
+    NotStarted,
 }
 
 /// The last words after a sentence that didn't finish.
@@ -395,7 +455,7 @@ const CLOSE: &[u8] = b"\r\n.\r\nCANCEL self\r\nQUIT\r\n";
 /// Speak `req` over `stream`, cancelling it when `changed()`.
 pub(super) fn converse(stream: &Stream, req: &Request<'_>, changed: &dyn Fn() -> bool) -> std::io::Result<Outcome> {
     stream.set_timeouts()?;
-    let mut c = Conversation { w: stream.try_clone()?, lines: Lines::new(stream.try_clone()?), event: None, changed };
+    let mut c = Conversation { w: stream.try_clone()?, lines: Lines::new(stream.try_clone()?), event: None, begun: false, changed };
     let result = c.speak(req);
     // The last words wait for no answer: a server that stopped answering mustn't hold up Stop.
     // After anything but a finished sentence our message may still be queued, or the server may
@@ -517,8 +577,12 @@ mod tests {
         End,
         /// Nothing until `CANCEL self`.
         Hold,
-        /// Cancelled by another client.
+        /// Cancelled by another client every time.
         CancelledByOther,
+        /// Cancelled by another client the first time only.
+        CancelledOnce,
+        /// Queued and never begun (paused before it began: no event at all).
+        NeverBegins,
         /// Paused by another client (`PAUSE all`).
         PausedByOther,
     }
@@ -530,6 +594,7 @@ mod tests {
             let mut got = Vec::new();
             let mut r = BufReader::new(s.try_clone().unwrap());
             let mut in_data = false;
+            let mut messages = 0;
             loop {
                 let mut line = String::new();
                 if r.read_line(&mut line).unwrap_or(0) == 0 {
@@ -542,7 +607,13 @@ mod tests {
                         continue;
                     }
                     in_data = false;
+                    messages += 1;
                     match ending {
+                        Ending::CancelledOnce if messages == 1 => {
+                            b"225-1\r\n225 OK MESSAGE QUEUED\r\n701 BEGIN\r\n703-1\r\n703-7\r\n703 CANCELED\r\n"
+                        }
+                        Ending::CancelledOnce => b"225-1\r\n225 OK MESSAGE QUEUED\r\n701 BEGIN\r\n702-1\r\n702-7\r\n702 END\r\n",
+                        Ending::NeverBegins => b"225-1\r\n225 OK MESSAGE QUEUED\r\n",
                         Ending::CancelledByOther => b"225-1\r\n225 OK MESSAGE QUEUED\r\n701 BEGIN\r\n703-1\r\n703-7\r\n703 CANCELED\r\n",
                         Ending::PausedByOther => b"225-1\r\n225 OK MESSAGE QUEUED\r\n701 BEGIN\r\n704-1\r\n704-7\r\n704 PAUSED\r\n",
                         Ending::End => b"225-1\r\n225 OK MESSAGE QUEUED\r\n702-1\r\n702-7\r\n702 END\r\n",
@@ -587,20 +658,48 @@ mod tests {
     }
 
     #[test]
-    fn a_sentence_another_client_cancels_or_pauses_halts_reading() {
-        // A screen reader's urgent message, `CANCEL all` or `PAUSE all` from another client: the
-        // sentence is neither skipped nor sent again over the other client's speech.
-        for ending in [Ending::CancelledByOther, Ending::PausedByOther] {
+    fn a_sentence_a_screen_reader_cuts_off_is_said_again_after_a_pause() {
+        // One announcement: the sentence is said again once it has had time to end.
+        let (client, srv) = UnixStream::pair().unwrap();
+        let h = server(srv, Ending::CancelledOnce);
+        let req = Request { text: "Interrupted by a screen reader.", rate: 0, lang: None };
+        let start = Instant::now();
+        assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap(), Outcome::Done);
+        assert!(start.elapsed() >= RESEND_AFTER[0], "it waited before saying it again");
+        let got = h.join().unwrap();
+        assert_eq!(speaks(&got), 2, "{got:?}");
+        assert!(got.contains(&"SET SELF NOTIFICATION BEGIN on".to_string()), "{got:?}");
+        assert!(!got.iter().any(|l| l.starts_with("CANCEL")), "{got:?}");
+    }
+
+    #[test]
+    fn a_sentence_another_client_keeps_stopping_halts_reading() {
+        // Cancelled every time (another client stopping everything, a failing module): two
+        // tries more, then reading halts, never moving on silently. A pause halts at once.
+        for (ending, sent) in [(Ending::CancelledByOther, 1 + RESEND_AFTER.len()), (Ending::PausedByOther, 1)] {
             let (client, srv) = UnixStream::pair().unwrap();
             let h = server(srv, ending);
             let req = Request { text: "Interrupted by a screen reader.", rate: 0, lang: None };
             assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap(), Outcome::Halted);
             let got = h.join().unwrap();
-            assert_eq!(speaks(&got), 1, "{got:?}");
+            assert_eq!(speaks(&got), sent, "{got:?}");
             assert!(got.contains(&"SET SELF NOTIFICATION PAUSE on".to_string()), "{got:?}");
-            // Only our own (paused) message is dropped.
+            // Only our own message is dropped.
             assert!(got.contains(&"CANCEL self".to_string()) && !got.iter().any(|l| l.eq_ignore_ascii_case("CANCEL all")), "{got:?}");
         }
+    }
+
+    #[test]
+    fn a_sentence_that_never_begins_halts_reading_instead_of_failing() {
+        // `PAUSE all` before our message began sends no event: the time queued has its own
+        // bound, and reaching it halts reading (Play carries on) rather than stopping with an error.
+        let (client, srv) = UnixStream::pair().unwrap();
+        let h = server(srv, Ending::NeverBegins);
+        let req = Request { text: "Queued behind another client.", rate: 0, lang: None };
+        let start = Instant::now();
+        assert_eq!(converse(&Stream::Unix(client), &req, &|| false).unwrap(), Outcome::Halted);
+        assert!(start.elapsed() >= QUEUE_WAIT && start.elapsed() < QUEUE_WAIT + REPLY_TIMEOUT * 2, "{:?}", start.elapsed());
+        assert!(h.join().unwrap().contains(&"CANCEL self".to_string()));
     }
 
     #[test]

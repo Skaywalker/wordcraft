@@ -1,6 +1,6 @@
 # Hardware parity with Microsoft Word
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-21 · **Change:** trivial (Linux Read Aloud review fixes: Speech Dispatcher address, language region, pausing when another program stops the sentence; previously trivial: Linux Read Aloud falls back to Speech Dispatcher when neither espeak-ng nor espeak is installed, and names the program to install; previously trivial: Pen / stylus row: two-stroke and closed-head arrows; previously trivial: Pen / stylus row: ink, eraser and Ink to Shape incl. arrows landed; previously trivial: a window too big for its screen shrinks to fit when it opens, #1215; previously trivial: 32-bit Windows starts on OpenGL; previously major: first version) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4 and Word for Windows
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-26 · **Change:** trivial (Linux Read Aloud: a sentence a screen reader cuts off is said again; previously trivial: Linux Read Aloud review fixes: Speech Dispatcher address, language region, pausing when another program stops the sentence; previously trivial: Linux Read Aloud falls back to Speech Dispatcher when neither espeak-ng nor espeak is installed, and names the program to install; previously trivial: Pen / stylus row: two-stroke and closed-head arrows; previously trivial: Pen / stylus row: ink, eraser and Ink to Shape incl. arrows landed; previously trivial: a window too big for its screen shrinks to fit when it opens, #1215; previously trivial: 32-bit Windows starts on OpenGL; previously major: first version) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4 and Word for Windows
 
 > **Printing update:** 2026-10-12 · direct desktop printing through craft-print; details below.
 
@@ -25,6 +25,7 @@ pens, microphones (Dictate) and speakers (Read Aloud), and displays.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-26 | trivial | Linux Read Aloud: a sentence another program's message cancels (a screen reader's announcement) is said again after a short pause, twice at most; cancelled again, paused by another program, or never begun, it pauses reading with a message |
 | 2026-10-21 | trivial | Linux Read Aloud review fixes: Speech Dispatcher is found at `SPEECHD_ADDRESS` (`unix_socket`, `inet_socket`) or the default socket, gets the sentence's language and region, and a sentence another program cancels or pauses (a screen reader's message, a stop for every program) pauses reading on it with a message instead of being skipped or said over the other program |
 | 2026-10-18 | trivial | Linux Read Aloud: Speech Dispatcher (over its socket, with the sentence's language; stopping cancels only WordCraft's own speech) when neither espeak-ng nor espeak is installed, a message naming the program to install when none is, and a speech program recommended by the `.deb` (`espeak-ng` or `speech-dispatcher`) and `.rpm` (`espeak-ng`) packages |
 | 2026-10-15 | trivial | Pen / stylus row: Ink to Shape also makes two-stroke arrows and arrows with a closed triangle head |
