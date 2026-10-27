@@ -218,17 +218,22 @@ pub(super) fn connect(changed: &dyn Fn() -> bool) -> Connection {
         }
         (Address::Inet(..), true) => return Connection::Unreachable("nothing answers at SPEECHD_ADDRESS".into()),
     }
-    let started = start.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    match started {
-        Err(e) if e.kind() == ErrorKind::NotFound => return Connection::Missing,
-        Err(e) => return Connection::Unreachable(format!("it couldn't be started: {e}")),
-        Ok(s) if !s.success() => {
+    // `--spawn` exits once it has forked the server; the wait for it is still bounded and gives way
+    // to Stop, so a start that hangs can't keep the reading thread (and Read Aloud with it) busy.
+    let until = Instant::now() + START_WAIT;
+    match start_server(&mut start, until, changed) {
+        Started::Exited(true) => {}
+        Started::Exited(false) => {
             return Connection::Unreachable("it isn't running and didn't start (its configuration may turn starting on demand off)".into());
         }
-        Ok(_) => {}
+        Started::Missing => return Connection::Missing,
+        Started::Failed(e) => return Connection::Unreachable(format!("it couldn't be started: {e}")),
+        Started::Interrupted => return Connection::Interrupted,
+        Started::TimedOut => {
+            return open(&address, changed).map_or_else(|_| Connection::Unreachable("starting it didn't finish in time".into()), Connection::Open);
+        }
     }
     // The server opens its socket a moment after it starts.
-    let until = Instant::now() + START_WAIT;
     loop {
         if changed() {
             return Connection::Interrupted;
@@ -241,6 +246,44 @@ pub(super) fn connect(changed: &dyn Fn() -> bool) -> Connection {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// How running the server's start command went.
+#[derive(Debug)]
+enum Started {
+    /// It exited, successfully or not.
+    Exited(bool),
+    /// The command isn't installed.
+    Missing,
+    /// It couldn't be run or waited for.
+    Failed(std::io::Error),
+    /// Reading moved on before it exited; it was stopped.
+    Interrupted,
+    /// It was still running at the deadline; it was stopped.
+    TimedOut,
+}
+
+/// Run `command` (output discarded) and wait for it to exit, at most until `until` and only while
+/// reading stays put; a command still running then is stopped and reaped.
+fn start_server(command: &mut std::process::Command, until: Instant, changed: &dyn Fn() -> bool) -> Started {
+    use std::process::Stdio;
+    let mut child = match command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(child) => child,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Started::Missing,
+        Err(e) => return Started::Failed(e),
+    };
+    let stopped = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Started::Exited(status.success()),
+            Ok(None) if changed() => break Started::Interrupted,
+            Ok(None) if Instant::now() >= until => break Started::TimedOut,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => break Started::Failed(e),
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    stopped
 }
 
 /// The sentence as SSIP message data: one line (a line break is a space when read aloud anyway),
@@ -809,5 +852,76 @@ mod tests {
         let req = Request { text: "x", rate: 0, lang: None };
         assert!(converse(&Stream::Unix(client), &req, &|| false).is_err());
         h.join().unwrap();
+    }
+
+    #[test]
+    fn a_start_command_that_exits_reports_how() {
+        let far = Instant::now() + Duration::from_secs(30);
+        let run = |script: &str| start_server(std::process::Command::new("sh").args(["-c", script]), far, &|| false);
+        assert!(matches!(run("exit 0"), Started::Exited(true)));
+        assert!(matches!(run("exit 1"), Started::Exited(false)));
+        let missing = start_server(&mut std::process::Command::new("no-such-program-for-wordcraft"), far, &|| false);
+        assert!(matches!(missing, Started::Missing), "{missing:?}");
+    }
+
+    /// A start command that never exits, writing its process id to `pid` first (whole, by renaming).
+    fn hanging_start(pid: &std::path::Path) -> std::process::Command {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "echo $$ > \"$1.part\" && mv \"$1.part\" \"$1\" && exec sleep 30", "sh"]).arg(pid);
+        c
+    }
+
+    /// A fresh path for a start command's process id.
+    fn pid_file(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("wordcraft-ssip-{}-{name}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("pid.part"));
+        p
+    }
+
+    /// The process id the start command wrote (whole, or still in its `.part` file when it was
+    /// stopped before renaming it); `None` when it was stopped before writing any.
+    fn written_pid(pid: &std::path::Path) -> Option<String> {
+        let part = pid.with_extension("pid.part");
+        let id = std::fs::read_to_string(pid).or_else(|_| std::fs::read_to_string(&part)).ok();
+        let _ = std::fs::remove_file(pid);
+        let _ = std::fs::remove_file(part);
+        id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty())
+    }
+
+    /// Is process `id` gone: reaped, not merely killed and left a zombie (which `kill -0` still
+    /// finds)?
+    fn gone(id: &str) -> bool {
+        let probe = std::process::Command::new("sh").args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", id]).status().unwrap();
+        !probe.success()
+    }
+
+    #[test]
+    fn a_start_command_that_hangs_is_stopped_at_the_deadline() {
+        // A start stopped before the stand-in wrote its id is tried again with a longer deadline
+        // (a loaded machine may not run it at once); one that never wrote it left nothing to reap.
+        for deadline in [Duration::from_secs(1), Duration::from_secs(3), Duration::from_secs(10)] {
+            let pid = pid_file("deadline");
+            let begun = Instant::now();
+            let got = start_server(&mut hanging_start(&pid), begun + deadline, &|| false);
+            assert!(matches!(got, Started::TimedOut), "{got:?}");
+            assert!(begun.elapsed() < deadline + Duration::from_secs(4), "{:?}", begun.elapsed());
+            if let Some(id) = written_pid(&pid) {
+                assert!(gone(&id), "the start command was reaped");
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn stop_ends_the_wait_for_a_start_command_at_once() {
+        let pid = pid_file("stop");
+        let begun = Instant::now();
+        // Stop once the command is surely running.
+        let got = start_server(&mut hanging_start(&pid), begun + Duration::from_secs(30), &|| pid.exists());
+        assert!(matches!(got, Started::Interrupted), "{got:?}");
+        assert!(begun.elapsed() < Duration::from_secs(5), "{:?}", begun.elapsed());
+        let id = written_pid(&pid).expect("stopped only once the id was written");
+        assert!(gone(&id), "the start command was reaped");
     }
 }
