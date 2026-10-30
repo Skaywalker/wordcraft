@@ -15,13 +15,13 @@
 //! - **Size.** At most `COMPOUNDWORDMAX` words (a `COMPOUNDROOT` stem, itself a compound, counts
 //!   as two). Past that a compound is still correct when it has at most the `COMPOUNDSYLLABLE`
 //!   count of syllables: Hungarian's 6–3 rule, where a compound of more than two words and more
-//!   than six syllables takes a hyphen; in a Hungarian dictionary (`LANG hu_HU`) a prefix of two
-//!   syllables or more on any part counts as a word. Syllables are the vowels
-//!   `COMPOUNDSYLLABLE` lists; the
-//!   inflections on the last part don't count. A suffix after which the word may compound again
-//!   forms a new word and counts, as do the suffix classes `SYLLABLENUM` lists. An inflected
-//!   form listed as a stem counts as its lemma (`st:` in its morphological fields: `falevelek`
-//!   as `falevél`).
+//!   than six syllables takes a hyphen. As in Hunspell, the compound's syllables are counted only
+//!   in a Hungarian dictionary (`LANG hu` or `hu_HU`; elsewhere only those of a bare last stem),
+//!   and there a prefix of two syllables or more on any part counts as a word. Syllables are the
+//!   vowels `COMPOUNDSYLLABLE` lists. The last part's outer suffix doesn't count when it is an
+//!   inflection (no continuation classes); with `SYLLABLENUM` given, Hunspell's Hungarian flags
+//!   add syllables back (see `uncounted_syllables`). An inflected form listed as a stem counts
+//!   as its lemma (`st:` in its morphological fields: `falevelek` as `falevél`).
 //! - **Boundaries.** `CHECKCOMPOUNDDUP` (no part twice in a row), `CHECKCOMPOUNDTRIPLE` (no
 //!   letter three times across a boundary: `sakkkör`), `CHECKCOMPOUNDCASE` (no capital at a
 //!   boundary), `CHECKCOMPOUNDPATTERN` (no part ending in one string, or with `0` a stem as
@@ -206,7 +206,11 @@ pub(super) struct Compounding {
     word_max: Option<usize>,
     syllable_max: Option<usize>,
     vowels: Box<[char]>,
-    syllable_num: Mask,
+    /// `SYLLABLENUM` is given: only that counts, as in Hunspell, which then applies its Hungarian
+    /// flags (`c`, `J`, `I`; [`AffixDict::uncounted_syllables`]).
+    syllable_num: bool,
+    /// The bit of the flag `J`, for Hunspell's Hungarian `SYLLABLENUM` rule.
+    j: Mask,
     /// [`LEMMA_FLAGS`]' bits.
     lemma: [Mask; 3],
     check_dup: bool,
@@ -216,7 +220,7 @@ pub(super) struct Compounding {
     patterns: Vec<Pattern>,
     rules: Vec<Vec<(Mask, Repeat)>>,
     breaks: Vec<String>,
-    /// `LANG hu_HU`: the dictionary is Hungarian (see [`AffixDict::part_ok`]).
+    /// `LANG hu` or `hu_HU`: the dictionary is Hungarian (see [`AffixDict::part_ok`]).
     hungarian: bool,
 }
 
@@ -237,7 +241,8 @@ impl Default for Compounding {
             word_max: None,
             syllable_max: None,
             vowels: Box::new([]),
-            syllable_num: Mask::EMPTY,
+            syllable_num: false,
+            j: Mask::EMPTY,
             lemma: [Mask::EMPTY; 3],
             check_dup: false,
             check_rep: false,
@@ -289,7 +294,7 @@ fn parse_rule(text: &str, bit_of: &dyn Fn(char) -> Mask) -> Result<Vec<(Mask, Re
 impl Compounding {
     /// Read the directive lines kept by [`TableHeaders`].
     pub(super) fn from_lines(lines: &[String], bit_of: &dyn Fn(char) -> Mask) -> Result<Compounding, String> {
-        let mut c = Compounding { lemma: LEMMA_FLAGS.map(bit_of), ..Compounding::default() };
+        let mut c = Compounding { lemma: LEMMA_FLAGS.map(bit_of), j: bit_of('J'), ..Compounding::default() };
         for line in lines {
             let f: Vec<&str> = line.split(' ').filter(|s| !s.is_empty()).collect();
             let at = |k: usize| f.get(k).copied().unwrap_or("");
@@ -312,7 +317,7 @@ impl Compounding {
                     c.syllable_max = Some(number(at(1))?);
                     c.vowels = at(2).chars().collect();
                 }
-                "SYLLABLENUM" => c.syllable_num = flags(at(1)),
+                "SYLLABLENUM" => c.syllable_num = !at(1).is_empty(),
                 "CHECKCOMPOUNDDUP" => c.check_dup = true,
                 "CHECKCOMPOUNDREP" => c.check_rep = true,
                 "CHECKCOMPOUNDCASE" => c.check_case = true,
@@ -327,7 +332,8 @@ impl Compounding {
                 }
                 "COMPOUNDRULE" => c.rules.push(parse_rule(at(1), bit_of)?),
                 "BREAK" if !at(1).is_empty() => c.breaks.push(at(1).to_string()),
-                "LANG" => c.hungarian = at(1) == "hu" || at(1).starts_with("hu_") || at(1).starts_with("hu-"),
+                // Hunspell knows Hungarian by these two names only (`hu_RO` isn't).
+                "LANG" => c.hungarian = matches!(at(1), "hu" | "hu_HU"),
                 _ => {}
             }
         }
@@ -356,8 +362,10 @@ struct Part {
     stem: Mask,
     /// No suffix: the stem ends where the part does (`CHECKCOMPOUNDPATTERN 0`).
     suffixless: bool,
-    /// Syllables of its suffixes that don't count toward the 6–3 rule.
-    uncounted: usize,
+    /// What a last part adds to the 6–3 rule's count, the smaller the better (0 elsewhere): in a
+    /// Hungarian dictionary minus its uncounted syllables ([`AffixDict::uncounted_syllables`]),
+    /// in another the syllables of a bare stem (the only ones Hunspell counts there).
+    counted: isize,
 }
 
 /// One compound search: the word, its char boundaries, the parts looked up so far and the
@@ -473,11 +481,18 @@ impl AffixDict {
             // own, on any part, as in Hunspell (`kerekasztal` + `elő` + `döntőbíró`).
             let long_prefix = c.hungarian && p.prefix.is_some_and(|r| self.syllables(&r.add) > 1);
             let words = if p.stem.meets(c.root) { 2 } else { 1 } + usize::from(long_prefix);
-            let uncounted = if place == Place::Last { self.uncounted_syllables(p) } else { 0 };
-            if best.is_none_or(|q| (words, std::cmp::Reverse(uncounted)) < (q.words, std::cmp::Reverse(q.uncounted))) {
-                best = Some(Part { words, stem: p.stem, suffixless: p.suffixes[0].is_none(), uncounted });
+            let last = place == Place::Last;
+            let counted = match (last, c.hungarian) {
+                (false, _) => 0,
+                (true, true) => self.uncounted_syllables(p).saturating_neg(),
+                (true, false) if p.affixed() => 0,
+                (true, false) => isize::try_from(self.syllables(text)).unwrap_or(isize::MAX),
+            };
+            let part = Part { words, stem: p.stem, suffixless: p.suffixes[0].is_none(), counted };
+            if best.is_none_or(|q| (part.words, part.counted) < (q.words, q.counted)) {
+                best = Some(part);
             }
-            // The last part may yet have a reading with more uncounted inflection.
+            // The last part may yet have a reading that adds fewer syllables to the count.
             words == 1 && place != Place::Last
         });
         s.parts.insert((a, b, place), best);
@@ -523,15 +538,36 @@ impl AffixDict {
         !(place != Place::Last && p.suffix_rules().any(|r: &Rule| !r.cont.meets(inside)))
     }
 
-    /// Syllables of the suffixes on a parse that the 6–3 rule doesn't count: the inflections.
-    /// A suffix after which the word may compound again (a compound flag in its continuation
-    /// classes: `ápol` + `ás`) forms a new word and counts, as do the classes `SYLLABLENUM`
-    /// lists (`-szerű`, `-féle`).
-    fn uncounted_syllables(&self, p: &Parse<'_>) -> usize {
+    /// Syllables of a parse's suffixes that the 6–3 rule doesn't count, as Hunspell counts them in
+    /// a Hungarian dictionary (the only one where it counts them): the outer suffix's when it
+    /// carries no continuation classes, an inflection (`hoz` of `végrehajt` + `ás` + `hoz`); and
+    /// one for a suffix with them ending in `i` but not `ti` or `yi` (`-ási`), alone or under
+    /// another (`-ási` + `ak`).
+    /// Negative when `SYLLABLENUM` adds syllables back: two for a suffix flagged `c` (`-szerű`,
+    /// `-fajta`), one for `J`, and one for `I` on a stem flagged `J`; the suffix is the outer one,
+    /// or the one under it when the outer appends nothing.
+    fn uncounted_syllables(&self, p: &Parse<'_>) -> isize {
         let c = &self.compound;
-        let forms_word = c.flag | c.begin | c.middle | c.end | c.syllable_num;
         let lemma = (1..).zip(c.lemma).find(|(_, m)| p.stem.meets(*m)).map_or(0, |(n, _)| n);
-        lemma + p.suffix_rules().filter(|r| !r.cont.meets(forms_word) && !r.bit.meets(c.syllable_num)).map(|r| self.syllables(&r.add)).sum::<usize>()
+        let Some(outer) = p.suffixes[0] else { return lemma };
+        let inflection = if outer.cont.is_empty() { isize::try_from(self.syllables(&outer.add)).unwrap_or(isize::MAX) } else { 0 };
+        // The suffix Hunspell checks on its own: the inner of two, else a lone one with classes.
+        let checked = p.suffixes[1].or(Some(outer).filter(|r| !r.cont.is_empty()));
+        let ends_in_i = |r: &Rule| {
+            let mut back = r.add.chars().rev();
+            back.next() == Some('i') && !matches!(back.next(), Some('t' | 'y'))
+        };
+        let taken = inflection.saturating_add(isize::from(checked.is_some_and(ends_in_i)));
+        // An outer suffix that appends nothing leaves the flag of the one under it, if any.
+        let flagged = if outer.add.is_empty() { p.suffixes[1].filter(|r| !r.add.is_empty()) } else { Some(outer) };
+        let added = match flagged.map(|r| r.flag) {
+            _ if !c.syllable_num => 0,
+            Some('c') => 2,
+            Some('J') => 1,
+            Some('I') if p.stem.meets(c.j) => 1,
+            _ => 0,
+        };
+        lemma.saturating_add(taken).saturating_sub(added)
     }
 
     fn syllables(&self, s: &str) -> usize {
@@ -587,7 +623,11 @@ impl AffixDict {
             && words > max
         {
             let Some(syllables) = c.syllable_max else { return false };
-            if self.syllables(w).saturating_sub(last.uncounted) > syllables {
+            // As in Hunspell, the compound's syllables count only in a Hungarian dictionary;
+            // elsewhere only a bare last stem's own.
+            let whole = if c.hungarian { isize::try_from(self.syllables(w)).unwrap_or(isize::MAX) } else { 0 };
+            let counted = whole.saturating_add(last.counted);
+            if counted > isize::try_from(syllables).unwrap_or(isize::MAX) {
                 return false;
             }
         }
@@ -712,6 +752,7 @@ mod tests {
 
     /// A small dictionary in the shape of the Hungarian one, written for these tests.
     const AFF: &str = "SET UTF-8
+LANG hu_HU
 FORBIDDENWORD W
 COMPOUNDFLAG Y
 COMPOUNDBEGIN B
@@ -860,14 +901,47 @@ ipso facto\t1
         assert_words(&d, &["üzelmok", "üzelmban", "baj", "bajok"], &["üzelm"]);
     }
 
+    /// The 6–3 rule's syllables as the Hunspell 1.7 command line counts them: three parts of 2, 1
+    /// and 3 syllables, then a suffix.
     #[test]
-    fn syllablenum_suffixes_count_toward_the_six_three_rule() {
-        // `ban` is inflection and doesn't count, unless `SYLLABLENUM` lists its class.
-        let d = dict();
-        let counted = AffixDict::from_hunspell(&format!("{AFF}SYLLABLENUM s\n"), DIC, &[]).unwrap();
-        assert!(d.check("almatetőkulcsfaban"), "6 of 7 syllables count");
-        assert!(!counted.check("almatetőkulcsfaban"), "all 7 count");
-        assert!(counted.check("almatetőkulcsfa") && counted.check("almafaban"));
+    fn six_three_syllables_follow_hunspell() {
+        let aff = |extra: &str| format!("SET UTF-8\nFLAG UTF-8\nLANG hu_HU\nCOMPOUNDFLAG Y\nCOMPOUNDWORDMAX 2\nCOMPOUNDSYLLABLE 6 aeiou\n{extra}");
+        let word = |extra: &str, dic: &str, w: &str| AffixDict::from_hunspell(&aff(extra), dic, &[]).unwrap().check(w);
+        // An inflection doesn't count, whatever SYLLABLENUM lists: only its flags c, J and I do.
+        let one = "SFX S Y 1\nSFX S 0 ka .\n";
+        assert!(!word(one, "3\ntata/Y\ntet/Y\ntototutu/YS\n", "tatatettototutuka"), "7 of 8 count");
+        for extra in ["", "SYLLABLENUM S\n", "SYLLABLENUM m\n"] {
+            assert!(word(&format!("{extra}{one}"), "3\ntata/Y\ntet/Y\ntototu/YS\n", "tatatettototuka"), "{extra:?}");
+        }
+        for (flag, stem, right) in [('c', "", false), ('J', "", false), ('I', "", true), ('I', "J", false)] {
+            let extra = format!("SYLLABLENUM m\nSFX {flag} Y 1\nSFX {flag} 0 ka .\n");
+            let dic = format!("3\ntata/Y\ntet/Y\ntototu/Y{flag}{stem}\n");
+            assert_eq!(word(&extra, &dic, "tatatettototuka"), right, "{flag} on a stem with {stem:?}");
+        }
+        // Of two suffixes the outer inflection doesn't count; a suffix with continuation classes
+        // counts, but one syllable of a lone one ending in `i` (not `ti` or `yi`) doesn't.
+        let two = "SFX A Y 1\nSFX A 0 to/B .\nSFX B Y 1\nSFX B 0 ka .\nSFX T Y 1\nSFX T 0 ti/B .\nSFX E Y 1\nSFX E 0 si/B .\n";
+        let dic = "4\ntata/Y\ntet/Y\ntotu/YA\ntototu/YTE\n";
+        assert!(word(two, dic, "tatatettotutoka") && word(two, dic, "tatatettototusi"));
+        assert!(!word(two, dic, "tatatettototuti"));
+        assert!(word(two, "4\ntata/Y\ntet/Y\ntototu/YE\nx\n", "tatatettototusika"), "an inner -si leaves one out");
+        // A suffix that appends nothing adds no syllable back.
+        assert!(word("SYLLABLENUM m\nSFX c Y 1\nSFX c 0 0/Y .\n", "3\ntata/Y\ntet/Y\ntototu/c\n", "tatatettototu"));
+        // Without a Hungarian LANG (`hu_RO` isn't one), only a bare last stem's syllables count.
+        for lang in ["", "LANG hu_RO\n"] {
+            let plain = |dic: &str, w: &str| AffixDict::from_hunspell(&aff("").replace("LANG hu_HU\n", lang), dic, &[]).unwrap().check(w);
+            assert!(plain("3\ntata/Y\ntet/Y\ntototutu/Y\n", "tatatettototutu"), "{lang:?}");
+            assert!(!plain("3\ntata/Y\ntet/Y\ntototututututu/Y\n", "tatatettototututututu"), "{lang:?}");
+        }
+        // A bare reading loses to an affixed one that counts fewer syllables.
+        let two_readings = "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDWORDMAX 2\nCOMPOUNDSYLLABLE 6 aeiou\nSFX S Y 1\nSFX S 0 tutu/X .\nSFX X Y 1\nSFX X 0 ka .\n";
+        let d = AffixDict::from_hunspell(two_readings, "4\ntata/Y\ntet/Y\ntototututututu/Y\ntototututu/YS\n", &[]).unwrap();
+        assert!(d.check("tatatettototututututu"));
+        // Under an outer suffix that appends nothing, the inner one's flag adds syllables back.
+        let empty_outer = "SET UTF-8\nFLAG UTF-8\nLANG hu_HU\nCOMPOUNDFLAG Y\nCOMPOUNDWORDMAX 2\nCOMPOUNDSYLLABLE 6 aeiou\nSYLLABLENUM c\nNEEDAFFIX N\nSFX c Y 2\nSFX c 0 ka/cN .\nSFX c 0 0 .\n";
+        assert!(!AffixDict::from_hunspell(empty_outer, "3\ntata/Y\ntet/Y\ntotu/Yc\n", &[]).unwrap().check("tatatettotuka"));
+        let suffixed = "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDWORDMAX 2\nCOMPOUNDSYLLABLE 6 aeiou\nSFX S Y 1\nSFX S 0 ka .\n";
+        assert!(AffixDict::from_hunspell(suffixed, "3\ntata/Y\ntet/Y\ntototututututu/YS\n", &[]).unwrap().check("tatatettototututututuka"));
     }
 
     #[test]
