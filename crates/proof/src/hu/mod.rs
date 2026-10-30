@@ -99,18 +99,20 @@ fn is_latin_letter(c: char) -> bool {
     c.is_alphabetic() && (c < '\u{0250}' || ('\u{1E00}'..='\u{1EFF}').contains(&c))
 }
 
-/// Is `c` a sign hu_HU lists with its endings (`%-os`, `‰-es`, `§-ával`, `°C-on`, `€-ért`, `$-t`)?
+/// Is `c` a sign hu_HU lists with its endings (`%-os`, `‰-es`, `§-ával`, `°C-on`, `€-ért`)?
 /// Other punctuation before a word (`(`, `„`) is no part of it.
 fn is_sign(c: char) -> bool {
-    matches!(c, '%' | '‰' | '§' | '°' | '€' | '$')
+    matches!(c, '%' | '‰' | '§' | '°' | '€')
 }
 
 /// The texts the word at `a..b` of `text` is checked as, any of which may be correct; empty: the
-/// word alone. A word right after a sign, or after a sign and a hyphen, is checked with the sign
-/// (`os` of `27%-os`, `C-on` of `5 °C-on`), which word splitting leaves out. An ending after an
-/// abbreviation (`ben` in `Kft.-ben.`) is checked with the abbreviation, so a wrong ending is marked alone. The abbreviation is checked with its ending
-/// or else with its period alone (`Kft.` in `Kft.-bem` is right); a word before a period with it
-/// (`pl.`, an abbreviation the dictionary may list with it).
+/// word alone. A word right after a sign, or after a sign and a hyphen, is also checked with the
+/// sign (`os` of `27%-os`, `C-on` of `5 °C-on`), which word splitting leaves out; a word that is
+/// right alone stays right (`ért` of `€ért`). An ending after an abbreviation (`ben` in
+/// `Kft.-ben.`) is checked with the abbreviation, so a wrong ending is marked alone. The
+/// abbreviation is checked with its ending or else with its period alone (`Kft.` in `Kft.-bem` is
+/// right); a word before a period with it (`pl.`, an abbreviation the dictionary may list with
+/// it).
 pub(crate) fn spelling_spans(text: &str, a: usize, b: usize) -> Vec<(usize, usize)> {
     let is_w = |c: char| c.is_alphanumeric();
     let word_end = |from: usize| text.get(from..).map(|r| from + r.find(|c: char| !is_w(c)).unwrap_or(r.len()));
