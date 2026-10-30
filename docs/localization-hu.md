@@ -1,6 +1,6 @@
 # Hungarian interface
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-23 · **Change:** trivial (abbreviations with their period, no NOSUGGEST suggestions, fewer false comma and space marks; previously minor: Hungarian proofing: spelling, suggestions, grammar, hyphenation; previously trivial: the catalog moved to storytold/craft-i18n, `locales/hu/wordcraft.tsv`; previously trivial: interface-language tests: a missing translation never fails a test, `cargo xtask i18n-report` in `cargo xtask ci` prints the strings each language lacks, and lookup and template tests use inline fixture catalogs or the pseudo-language; previously trivial: the interface audit lists missing Hungarian entries instead of failing; previously minor: Hungarian interface catalog and regression checks) · **Target:** WordCraft 0.5.0
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** trivial (a verbal prefix with two suffixes; previously trivial: abbreviations with their period, no NOSUGGEST suggestions, fewer false comma and space marks; previously minor: Hungarian proofing: spelling, suggestions, grammar, hyphenation; previously trivial: the catalog moved to storytold/craft-i18n, `locales/hu/wordcraft.tsv`; previously trivial: interface-language tests: a missing translation never fails a test, `cargo xtask i18n-report` in `cargo xtask ci` prints the strings each language lacks, and lookup and template tests use inline fixture catalogs or the pseudo-language; previously trivial: the interface audit lists missing Hungarian entries instead of failing; previously minor: Hungarian interface catalog and regression checks) · **Target:** WordCraft 0.5.0
 
 Choose **File › Options › Interface language › Magyar**, or follow a Hungarian system display
 language (`hu-HU`, `hu_HU.UTF-8`). The catalog code is `hu`; `ui.language` with `{"value":"hu"}`
@@ -75,8 +75,9 @@ writes new documents in Hungarian.
   in File › Options › Proofing › Dictionaries folder. Without it Hungarian text has no spelling
   marks. The affix engine reads the dictionary's flag aliases, compounding rules and word breaks,
   so compounds (`almafa`, `házkulcsban`), the 6–3 rule for long ones, and hyphenated forms
-  (`SMS-ben`, `Petőfi-vers`) are checked as Hunspell checks them: on 31,248 test words labelled by
-  the Hunspell command line, the results agree on 99.8%. Abbreviations the dictionary lists with
+  (`SMS-ben`, `Petőfi-vers`) are checked as Hunspell checks them, a verbal prefix with two suffixes
+  too (`megrendelések`, `díjbekérőt`): on 31,248 test words labelled by the Hunspell command line,
+  the results agree on 99.8%. Abbreviations the dictionary lists with
   their period (`pl.`, `stb.`, `kb.`) are correct with it and wrong without it, and take their
   endings after a hyphen (`Kft.-ben`, `szept.-ben`).
 - **Suggestions**: missing accents first (`hazban` → `házban`), the dictionary's confusion table
@@ -109,6 +110,7 @@ and contain no data from either.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | trivial | A verbal prefix with two suffixes is a word (`megrendelések`, `visszaigazolások`), its cross products as the Hunspell command line licenses them |
 | 2026-10-23 | trivial | The catalog moved to storytold/craft-i18n (`locales/hu/wordcraft.tsv`) |
 | 2026-10-23 | trivial | Lookup, context, template, style-name and command-search tests use inline fixture catalogs or the pseudo-language; tests that asserted one language's catalog wording removed |
 | 2026-10-23 | trivial | Interface-language tests: a missing translation falls back to English and never fails a test; `cargo xtask i18n-report` (part of `cargo xtask ci`) prints the strings each language lacks; single-language coverage tests removed |
