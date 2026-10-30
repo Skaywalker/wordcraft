@@ -253,6 +253,27 @@ impl Parse<'_> {
     fn outer_cont(&self) -> Mask {
         self.suffixes[0].or(self.prefix).map_or(Mask::EMPTY, |r| r.cont)
     }
+
+    /// Does the outermost affix still need another (`need`, the `NEEDAFFIX` flag, in its
+    /// continuation)? A prefix whose own continuation lacks it supplies one to the outer suffix,
+    /// as in Hunspell (`un` + `work` + `s/N`). (Hunspell also lets the outer of two suffixes
+    /// need an affix; this doesn't.)
+    fn needs_affix(&self, need: Mask) -> bool {
+        match (self.prefix, self.suffixes[0]) {
+            (Some(p), Some(s)) => s.cont.meets(need) && p.cont.meets(need),
+            _ => self.outer_cont().meets(need),
+        }
+    }
+}
+
+/// The first reading [`AffixDict::simple_reading`] meets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reading {
+    Word,
+    /// A `FORBIDDENWORD` stem: the word is wrong.
+    Forbidden,
+    /// A prefix on an `ONLYINCOMPOUND` stem: no word alone, perhaps a compound.
+    CompoundOnly,
 }
 
 /// Which suffix counts [`AffixDict::suffix_parses`] and [`AffixDict::prefix_parses`] read.
@@ -927,7 +948,8 @@ impl AffixDict {
 
     /// [`AffixDict::parses`] in the order of Hunspell's affix search, step by step: the stem,
     /// a prefix with at most one suffix, one suffix, two suffixes, a prefix with two. Within a
-    /// step the shorter affix comes first, as there.
+    /// step the shorter affix comes first, as there; for one affix text the homonyms come before
+    /// the rules, where Hunspell goes the other way.
     fn parses_in_steps(&self, w: &str, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
         if w.is_empty() || w.len() > MAX_WORD_BYTES {
             return false;
@@ -1062,21 +1084,28 @@ impl AffixDict {
         if !p.affixed() && p.stem.meets(c.need_affix) {
             return false;
         }
-        !p.outer_cont().meets(c.need_affix) && !p.conts().meets(c.only_in)
+        !p.needs_affix(c.need_affix) && !p.conts().meets(c.only_in)
     }
 
     /// How `w` (normalized) reads without compounding. Hunspell's affix search stops at the
-    /// first reading it meets ([`AffixDict::parses_in_steps`]): `Some(true)` when that is a word,
-    /// `Some(false)` when its stem is `FORBIDDENWORD`, so no later reading counts (`megfedés` +
-    /// `emben` is wrong, though `meg` + `fed` + `és` + `emben` parses) and neither does a
-    /// compound. `None`: no reading.
-    fn simple_reading(&self, w: &str, deny: Mask) -> Option<bool> {
+    /// first reading it meets ([`AffixDict::parses_in_steps`]). [`Reading::Forbidden`] when its
+    /// stem is `FORBIDDENWORD`: no later reading counts (`megfedés` + `emben` is wrong, though
+    /// `meg` + `fed` + `és` + `emben` parses), and neither does a compound. `None`: no reading.
+    fn simple_reading(&self, w: &str, deny: Mask) -> Option<Reading> {
+        let c = &self.compound;
         let mut first = None;
         self.parses_in_steps(w, &mut |p| {
+            // A prefix alone on an `ONLYINCOMPOUND` stem ends the search too, with no word: the
+            // word may only be a compound then, as in Hunspell (`un` + `ab/PO` keeps `una` + `b`
+            // out). A prefix that can't stand alone doesn't count, nor does a suffix after it.
+            if p.stem.meets(c.only_in) && p.suffixes[0].is_none() && p.prefix.is_some_and(|r| !r.cont.meets(c.need_affix | c.only_in)) {
+                first = Some(Reading::CompoundOnly);
+                return true;
+            }
             if !self.stands(p, deny) {
                 return false;
             }
-            first = Some(!p.stem.meets(self.forbidden));
+            first = Some(if p.stem.meets(self.forbidden) { Reading::Forbidden } else { Reading::Word });
             true
         });
         first
@@ -1103,8 +1132,9 @@ impl AffixDict {
             return Some(false);
         }
         match self.simple_reading(w, deny) {
-            None => self.compound_word(w, deny, budget).then_some(true),
-            reading => reading,
+            Some(Reading::Word) => Some(true),
+            Some(Reading::Forbidden) => Some(false),
+            Some(Reading::CompoundOnly) | None => self.compound_word(w, deny, budget).then_some(true),
         }
     }
 
@@ -1257,17 +1287,18 @@ impl AffixDict {
         }
         let c = &self.compound;
         let mut out = if f.meets(c.need_affix) { Vec::new() } else { vec![stem.to_string()] };
-        // A form whose outer affix needs another one is no word; one through an affix that may
-        // stand only inside compounds is none either, nor anything built on it.
+        // A form whose outer affix needs another one is no word on its own (a prefix that needs
+        // none may supply it); one through an affix that may stand only inside compounds is none
+        // either, nor anything built on it.
         let outer_ok = |r: &Rule| !r.cont.meets(c.need_affix);
         // Suffix forms a prefix may join, each with the flags that license one there (the
-        // rules of [`AffixDict::suffix_parses`]).
-        let mut cross_sfx: Vec<(String, Mask)> = Vec::new();
+        // rules of [`AffixDict::suffix_parses`]) and whether the form still needs an affix.
+        let mut cross_sfx: Vec<(String, Mask, bool)> = Vec::new();
         // Suffix forms queued with the continuation classes they carry and the prefix flags they
         // license as an inner suffix, for chained expansion; each (form, classes) pair is
-        // expanded once.
+        // expanded once. The indices point into the first level, the only one merged.
         let mut chain: Vec<(String, Mask, Mask)> = Vec::new();
-        let mut queued: std::collections::HashSet<(String, Mask)> = std::collections::HashSet::new();
+        let mut queued: std::collections::HashMap<(String, Mask), usize> = std::collections::HashMap::new();
         let mut work = 0usize;
         for r in &self.suffixes {
             if !f.meets(r.bit) || !r.cond_matches(stem, true) {
@@ -1279,11 +1310,23 @@ impl AffixDict {
             }
             let form = format!("{base}{}", r.add);
             let licenses = if r.cross { f | r.cont } else { Mask::EMPTY };
-            if r.cross && outer_ok(r) {
-                cross_sfx.push((form.clone(), licenses));
+            if r.cross {
+                cross_sfx.push((form.clone(), licenses, !outer_ok(r)));
             }
-            if !r.cont.is_empty() && queued.insert((form.clone(), r.cont)) {
-                chain.push((form.clone(), r.cont, licenses));
+            if !r.cont.is_empty() {
+                // The same form and classes from another rule: one expansion, licensing what
+                // either licenses.
+                match queued.entry((form.clone(), r.cont)) {
+                    std::collections::hash_map::Entry::Occupied(at) => {
+                        if let Some(e) = chain.get_mut(*at.get()) {
+                            e.2 |= licenses;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(at) => {
+                        at.insert(chain.len());
+                        chain.push((form.clone(), r.cont, licenses));
+                    }
+                }
             }
             if outer_ok(r) {
                 out.push(form);
@@ -1313,10 +1356,13 @@ impl AffixDict {
                         continue;
                     }
                     let next = format!("{base}{}", r.add);
-                    if r.cross && outer_ok(r) {
-                        cross_sfx.push((next.clone(), r.cont | inner));
+                    if r.cross {
+                        cross_sfx.push((next.clone(), r.cont | inner, !outer_ok(r)));
                     }
-                    if !r.cont.is_empty() && queued.insert((next.clone(), r.cont)) {
+                    if !r.cont.is_empty()
+                        && let std::collections::hash_map::Entry::Vacant(at) = queued.entry((next.clone(), r.cont))
+                    {
+                        at.insert(chain.len());
                         chain.push((next.clone(), r.cont, Mask::EMPTY));
                     }
                     if outer_ok(r) {
@@ -1340,12 +1386,14 @@ impl AffixDict {
                 out.push(format!("{}{rest}", r.add));
             }
             if r.cross {
-                for (s, licenses) in &cross_sfx {
+                // A suffix that still needs an affix has it in a prefix that needs none.
+                let supplies = outer_ok(r);
+                for (s, licenses, needs) in &cross_sfx {
                     work += 1;
                     if out.len() >= MAX_FORMS || work > MAX_FORMS_WORK {
                         return out;
                     }
-                    if let Some(rest) = s.strip_prefix(&*r.strip).filter(|_| licenses.meets(r.bit)) {
+                    if let Some(rest) = s.strip_prefix(&*r.strip).filter(|_| licenses.meets(r.bit) && (supplies || !needs)) {
                         out.push(format!("{}{rest}", r.add));
                     }
                 }
@@ -1953,6 +2001,41 @@ pub(crate) mod tests {
             assert!(!AffixDict::from_hunspell(aff, dic, &[]).unwrap().contains(w), "{w} with {dic:?}");
         }
         assert!(AffixDict::from_hunspell(aff, "2\nfoox/Z\nbar/Z\n", &[]).unwrap().contains("fooxbar"));
+    }
+
+    /// `NEEDAFFIX`, `ONLYINCOMPOUND` and `CHECKCOMPOUNDREP` around prefixes, as with the Hunspell
+    /// 1.7 command line.
+    #[test]
+    fn prefixes_meet_needaffix_onlyincompound_and_rep_as_hunspell_does() {
+        // A prefix that needs no affix supplies one to a suffix that does.
+        let aff = "SET UTF-8\nFLAG UTF-8\nNEEDAFFIX N\nPFX P Y 1\nPFX P 0 un .\nPFX Q Y 1\nPFX Q 0 re/N .\nSFX S Y 1\nSFX S 0 s/N .\nSFX T Y 1\nSFX T 0 t .\n";
+        let d = AffixDict::from_hunspell(aff, "1\nwork/PQST\n", &[]).unwrap();
+        let forms = d.forms("work");
+        for (w, right) in [("unworks", true), ("reworkt", true), ("works", false), ("rework", false), ("reworks", false)] {
+            assert_eq!(d.contains(w), right, "{w}");
+            assert_eq!(forms.iter().any(|f| f == w), right, "forms, {w}");
+        }
+        // A prefix on an ONLYINCOMPOUND stem ends the search with no word.
+        let aff = "SET UTF-8\nFLAG UTF-8\nONLYINCOMPOUND O\nPFX P Y 1\nPFX P 0 un .\nSFX S Y 1\nSFX S 0 b .\nSFX T Y 1\nSFX T 0 c .\n";
+        assert!(!AffixDict::from_hunspell(aff, "2\nab/PO\nuna/S\n", &[]).unwrap().contains("unab"));
+        assert!(AffixDict::from_hunspell(aff, "2\nab/O\nuna/S\n", &[]).unwrap().contains("unab"));
+        // Not after a suffix, nor for a prefix that can't stand alone: the search goes on.
+        assert!(AffixDict::from_hunspell(aff, "2\nab/PTO\nunab/T\n", &[]).unwrap().contains("unabc"));
+        for prefix in ["un/N", "un/O"] {
+            let aff = format!("SET UTF-8\nFLAG UTF-8\nONLYINCOMPOUND O\nNEEDAFFIX N\nPFX P Y 1\nPFX P 0 {prefix} .\nSFX S Y 1\nSFX S 0 b .\n");
+            assert!(AffixDict::from_hunspell(&aff, "2\nab/PO\nuna/S\n", &[]).unwrap().contains("unab"), "{prefix}");
+        }
+        // CHECKCOMPOUNDREP leaves out patterns tied to the start or the end.
+        let aff = "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Z\nCOMPOUNDMIN 2\nCHECKCOMPOUNDREP\nREP 3\nREP ^x y\nREP r$ s\nREP q w\n";
+        assert!(AffixDict::from_hunspell(aff, "4\nxa/Z\nbar/Z\nyabar\nxabas\n", &[]).unwrap().contains("xabar"));
+        assert!(!AffixDict::from_hunspell(aff, "3\nqa/Z\nbar/Z\nwabar\n", &[]).unwrap().contains("qabar"));
+        // A candidate read as a prefix on an ONLYINCOMPOUND stem counts, as in candidate_check.
+        let aff = "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Z\nCOMPOUNDMIN 2\nCHECKCOMPOUNDREP\nREP 1\nREP q b\nONLYINCOMPOUND O\nPFX P Y 1\nPFX P 0 un .\nSFX S Y 1\nSFX S 0 b .\n";
+        assert!(!AffixDict::from_hunspell(aff, "4\nun/Z\naq/Z\nab/PO\nuna/S\n", &[]).unwrap().contains("unaq"));
+        // A prefix supplies the affix at the end of a compound too.
+        let aff = "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Z\nCOMPOUNDPERMITFLAG W\nNEEDAFFIX N\nPFX P Y 1\nPFX P 0 un/W .\nSFX S Y 1\nSFX S 0 s/N .\n";
+        let d = AffixDict::from_hunspell(aff, "2\nbar/Z\nwork/PSZ\n", &[]).unwrap();
+        assert!(d.contains("unworks") && d.contains("barunworks") && !d.contains("barworks"));
     }
 
     #[test]

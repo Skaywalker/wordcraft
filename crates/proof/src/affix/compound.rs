@@ -490,7 +490,7 @@ impl AffixDict {
         if p.stem.meets(self.forbidden | deny) {
             return false;
         }
-        if !p.affixed() && p.stem.meets(c.need_affix) || p.outer_cont().meets(c.need_affix) {
+        if !p.affixed() && p.stem.meets(c.need_affix) || p.needs_affix(c.need_affix) {
             return false;
         }
         // Two suffixes in a row need `COMPOUNDMORESUFFIXES`, except on the last part, which
@@ -595,25 +595,15 @@ impl AffixDict {
     }
 
     /// Is `w` a `REP` misspelling of a word: does one replacement turn it into a word without
-    /// compounding? `^` and `$` tie a pattern to the start or the end. Each word looked up costs
+    /// compounding? Patterns tied to the start or the end (`^orr`, `r$`) don't count, as in
+    /// Hunspell (`orrvadász` is right though `orvvadász` is a word). Each word looked up costs
     /// one unit of `budget`; with none left, `w` counts as a misspelling.
     fn rep_misspelling(&self, w: &str, budget: &mut u32) -> bool {
         for (from, to) in &self.rep {
-            let (anchored_start, from) = match from.strip_prefix('^') {
-                Some(f) => (true, f),
-                None => (false, from.as_str()),
-            };
-            let (anchored_end, from) = match from.strip_suffix('$') {
-                Some(f) => (true, f),
-                None => (false, from),
-            };
-            if from.is_empty() {
+            if from.is_empty() || from.starts_with('^') || from.ends_with('$') {
                 continue;
             }
-            for (i, _) in w.match_indices(from) {
-                if (anchored_start && i != 0) || (anchored_end && i + from.len() != w.len()) {
-                    continue;
-                }
+            for (i, _) in w.match_indices(from.as_str()) {
                 let (Some(head), Some(tail)) = (w.get(..i), w.get(i + from.len()..)) else { continue };
                 if *budget == 0 {
                     return true;
