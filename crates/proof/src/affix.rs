@@ -787,7 +787,69 @@ impl AffixDict {
         d.prefixes = rules.prefixes.into_iter().map(mk).collect::<Result<_, _>>()?;
         d.suffixes = rules.suffixes.into_iter().map(mk).collect::<Result<_, _>>()?;
         d.index();
+        d.index_compound_words();
         Ok(d)
+    }
+
+    /// The texts compound checks look for first ([`compound::Compounding::index_words`]),
+    /// once the stems and affix rules are in.
+    fn index_compound_words(&mut self) {
+        // Per flag, the most letters one of its suffixes strips.
+        let by_flag: Vec<usize> = self
+            .sfx_by_flag
+            .iter()
+            .map(|list| list.iter().filter_map(|&k| self.suffixes.get(k as usize)).map(|r| r.strip.chars().count()).max().unwrap_or(0))
+            .collect();
+        let mut under: FxMap<Mask, usize> = FxMap::default();
+        // A forbidden stem that may end a compound, itself or through a suffix's classes.
+        let ends = self.compound.ends();
+        let ending = |m: Mask| m.meets(ends) || self.rules_of(m).any(|r| r.cont.meets(ends));
+        let mut spaced = Vec::new();
+        let mut forbidden = Vec::new();
+        for i in 0..self.len() {
+            let Some(w) = self.word(i) else { continue };
+            if !w.contains(' ') && !self.entries(Some(i)).any(|m| m.meets(self.forbidden)) {
+                continue;
+            }
+            let masks: Vec<Mask> = self.entries(Some(i)).collect();
+            let strip = masks.iter().map(|&m| self.most_stripped(w, m, &by_flag, &mut under)).max().unwrap_or(0);
+            if masks.iter().any(|&m| m.meets(self.forbidden) && ending(m)) {
+                forbidden.push((w.to_string(), strip));
+            }
+            if let Some((head, _)) = w.split_once(' ') {
+                spaced.push((head.to_string(), w.replace(' ', ""), strip));
+                // A prefix that strips letters changes how the stem starts (`B` to `b`).
+                for p in self.prefixes.iter().filter(|p| !p.strip.is_empty()) {
+                    if let (Some(h), Some(j)) = (head.strip_prefix(&*p.strip), w.strip_prefix(&*p.strip)) {
+                        spaced.push((format!("{}{h}", p.add), format!("{}{}", p.add, j.replace(' ', "")), strip));
+                    }
+                }
+            }
+        }
+        self.compound.index_words(&spaced, &forbidden);
+    }
+
+    /// The suffix rules carrying a flag of `m`, a rule with several such flags once per flag.
+    fn rules_of(&self, m: Mask) -> impl Iterator<Item = &Rule> + '_ {
+        self.sfx_by_flag
+            .iter()
+            .enumerate()
+            .filter(move |&(b, _)| m.meets(Mask::bit(b)))
+            .flat_map(|(_, list)| list.iter().filter_map(|&k| self.suffixes.get(k as usize)))
+    }
+
+    /// The most letters of the stem `w` (with the flags `m`) one suffix, or two in a row, strip;
+    /// `by_flag`: per flag, the most one of its suffixes strips; `under`: that for continuation
+    /// classes met before.
+    fn most_stripped(&self, w: &str, m: Mask, by_flag: &[usize], under: &mut FxMap<Mask, usize>) -> usize {
+        let mut most = 0;
+        for r in self.rules_of(m).filter(|r| w.ends_with(&*r.strip)) {
+            let next = *under
+                .entry(r.cont)
+                .or_insert_with(|| by_flag.iter().enumerate().filter(|&(b, _)| r.cont.meets(Mask::bit(b))).map(|(_, &n)| n).max().unwrap_or(0));
+            most = most.max(r.strip.chars().count() + next.saturating_sub(r.add.chars().count()));
+        }
+        most
     }
 
     /// Build the suffix index and the stem hash table.

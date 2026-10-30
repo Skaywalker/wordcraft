@@ -222,6 +222,24 @@ pub(super) struct Compounding {
     breaks: Vec<String>,
     /// `LANG hu` or `hu_HU`: the dictionary is Hungarian (see [`AffixDict::part_ok`]).
     hungarian: bool,
+    /// The text before the first space of each stem that has one (`vasbeton` of `vasbeton fal`):
+    /// parts that read as such a stem are no compound ([`AffixDict::word_pair`]).
+    pub(super) pair_heads: std::collections::HashSet<String>,
+    /// The longest of `pair_heads`, in chars.
+    pub(super) pair_head_chars: usize,
+    /// The last three letters (or fewer, of a shorter one) of each of `pair_heads`.
+    pub(super) pair_head_ends: std::collections::HashSet<String>,
+    /// The first four letters (or fewer) of each stem with a space, the space taken out, no
+    /// further than a suffix can't strip.
+    pub(super) pair_starts: std::collections::HashSet<String>,
+    /// Some stem with a space is too short for `pair_starts`: the start isn't tested first.
+    pair_starts_all: bool,
+    /// The first letter or two of each forbidden stem that may end a compound, itself or through
+    /// a suffix (`ta` of `tanárúr`), no further than a
+    /// suffix can't strip: only a rest starting so is read for one ([`AffixDict::rest_is_whole`]).
+    forbidden_ends: std::collections::HashSet<String>,
+    /// Some forbidden stem is too short for `forbidden_ends`: every rest is read.
+    forbidden_ends_all: bool,
 }
 
 impl Default for Compounding {
@@ -252,6 +270,13 @@ impl Default for Compounding {
             rules: Vec::new(),
             breaks: Vec::new(),
             hungarian: false,
+            pair_heads: std::collections::HashSet::new(),
+            pair_head_chars: 0,
+            pair_head_ends: std::collections::HashSet::new(),
+            pair_starts: std::collections::HashSet::new(),
+            pair_starts_all: false,
+            forbidden_ends: std::collections::HashSet::new(),
+            forbidden_ends_all: false,
         }
     }
 }
@@ -292,6 +317,40 @@ fn parse_rule(text: &str, bit_of: &dyn Fn(char) -> Mask) -> Result<Vec<(Mask, Re
 }
 
 impl Compounding {
+    /// The flags with which a part may end a compound.
+    pub(super) fn ends(&self) -> Mask {
+        self.flag | self.end
+    }
+
+    /// Index the stems with a space, `(text before the space, the stem without it, the most
+    /// letters its suffixes strip)`, prefixed forms that strip letters included, and the
+    /// forbidden stems that may end a compound, `(stem, the most letters its suffixes strip)`.
+    pub(super) fn index_words(&mut self, spaced: &[(String, String, usize)], forbidden: &[(String, usize)]) {
+        let opening = |w: &str, strip: usize, most: usize| -> Option<String> {
+            let n = w.chars().count().saturating_sub(strip).min(most);
+            (n > 0).then(|| w.chars().take(n).collect())
+        };
+        for (head, joined, strip) in spaced {
+            self.pair_heads.insert(head.clone());
+            self.pair_head_ends.insert(head.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect());
+            match opening(joined, *strip, 4) {
+                Some(o) => {
+                    self.pair_starts.insert(o);
+                }
+                None => self.pair_starts_all = true,
+            }
+        }
+        self.pair_head_chars = self.pair_heads.iter().map(|h| h.chars().count()).max().unwrap_or(0);
+        for (w, strip) in forbidden {
+            match opening(w, *strip, 2) {
+                Some(o) => {
+                    self.forbidden_ends.insert(o);
+                }
+                None => self.forbidden_ends_all = true,
+            }
+        }
+    }
+
     /// Read the directive lines kept by [`TableHeaders`].
     pub(super) fn from_lines(lines: &[String], bit_of: &dyn Fn(char) -> Mask) -> Result<Compounding, String> {
         let mut c = Compounding { lemma: LEMMA_FLAGS.map(bit_of), j: bit_of('J'), ..Compounding::default() };
@@ -380,11 +439,21 @@ struct Search<'w> {
     failed: crate::patterns::FxMap<(usize, usize, usize), ()>,
     budget: u32,
     deny: Mask,
+    /// Only compounds of two parts.
+    two_only: bool,
+    /// Per boundary: may only a last part start there ([`AffixDict::rest_is_whole`])?
+    whole_rests: crate::patterns::FxMap<usize, bool>,
 }
 
 impl AffixDict {
     /// Is `w` (normalized, case as written) a compound word?
     pub(super) fn compound_word(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
+        self.compound_search(w, deny, budget, true)
+    }
+
+    /// [`AffixDict::compound_word`]; `two_words`: a word that splits into two words of its own
+    /// is a compound only as those two.
+    fn compound_search(&self, w: &str, deny: Mask, budget: &mut u32, two_words: bool) -> bool {
         let c = &self.compound;
         if (!c.enabled() && c.rules.is_empty()) || w.len() > super::MAX_WORD_BYTES {
             return false;
@@ -396,10 +465,37 @@ impl AffixDict {
         if *budget == 0 {
             return false;
         }
-        let mut s = Search { w, bounds, parts: Default::default(), failed: Default::default(), budget: *budget, deny };
-        let found = (c.enabled() && self.compound_from(&mut s, 0, 0, None)) || c.rules.iter().any(|r| self.rule_from(&mut s, r, 0, 0, 0));
+        let mut s = Search {
+            w,
+            bounds,
+            parts: Default::default(),
+            failed: Default::default(),
+            budget: *budget,
+            deny,
+            two_only: false,
+            whole_rests: Default::default(),
+        };
+        let mut found = c.enabled() && self.compound_from(&mut s, 0, 0, None);
+        // A word that splits into two words of its own (`műanyag` + `cső`) is a compound only
+        // as those two, as with the Hunspell command line: `műanyagcső` is wrong while
+        // `mű` + `anyag` + `cső` would parse, but `műanyagcsőgyár` is right.
+        // A compound of two parts is right either way, and the cheaper search: the split into
+        // two words is looked for only without one.
+        if found && two_words {
+            s.two_only = true;
+            s.failed.clear();
+            found = self.compound_from(&mut s, 0, 0, None) || !self.two_words(w, deny);
+        }
+        let found = found || c.rules.iter().any(|r| self.rule_from(&mut s, r, 0, 0, 0));
         *budget = s.budget;
         found
+    }
+
+    /// Does `w` split into two words of their own (a listed stem or an affixed form, not
+    /// forbidden), anywhere?
+    fn two_words(&self, w: &str, deny: Mask) -> bool {
+        let word = |t: &str| self.simple_reading(t, deny) == Some(super::Reading::Word);
+        w.char_indices().skip(1).any(|(i, _)| w.get(..i).is_some_and(word) && w.get(i..).is_some_and(word))
     }
 
     /// Can `s.w` from boundary `start` on be the rest of a compound that has `words` words so
@@ -432,7 +528,11 @@ impl AffixDict {
             if start == 0 && is_last {
                 continue;
             }
-            if !is_last && last_bound - end < c.min {
+            if !is_last && (last_bound - end < c.min || (s.two_only && start > 0)) {
+                continue;
+            }
+            // A rest already found whole takes no more parts from here.
+            if !is_last && s.whole_rests.get(&start) == Some(&true) {
                 continue;
             }
             let (Some(&a), Some(&b)) = (s.bounds.get(start), s.bounds.get(end)) else { continue };
@@ -447,6 +547,9 @@ impl AffixDict {
             // long word try split after split for free.
             s.budget = s.budget.saturating_sub(1);
             let Some(part) = self.part(s, a, b, place) else { continue };
+            if !is_last && self.rest_is_whole(s, start) {
+                continue;
+            }
             if let Some((pa, pb, prev_part)) = prev
                 && !self.boundary_ok(s.w, (pa, pb, prev_part), (a, b, part), &mut s.budget)
             {
@@ -581,13 +684,11 @@ impl AffixDict {
         if cfg.check_dup && left == right {
             return false;
         }
-        // Two parts that together are a listed word are that word (`lég` + `záró` is
-        // `légzáró`), which compounds only as its own flags allow.
         let Some(joined) = w.get(a..d) else { return false };
-        if self.stem_mask(joined).is_some() {
+        if cfg.check_rep && self.rep_misspelling(joined, budget) {
             return false;
         }
-        if cfg.check_rep && self.rep_misspelling(joined, budget) {
+        if !cfg.pair_heads.is_empty() && self.word_pair(joined, budget) {
             return false;
         }
         let mut l = left.chars().rev();
@@ -632,6 +733,79 @@ impl AffixDict {
             }
         }
         !(c.check_rep && self.rep_misspelling(w, budget))
+    }
+
+    /// Is the rest of the word from boundary `start` a whole that no further parts may make up,
+    /// as with the Hunspell command line? So it is when it reads as a stem with a space
+    /// (`hajnyíró gép`: `hajnyírógép` is wrong) or as a forbidden word that may end a compound,
+    /// by its own flags or the classes of the suffix right on it, a suffix after that aside
+    /// (`tanárúr`: `háztanárúr` is wrong, `tanárúrház` right). Looked up once per boundary.
+    fn rest_is_whole(&self, s: &mut Search<'_>, start: usize) -> bool {
+        if let Some(&known) = s.whole_rests.get(&start) {
+            return known;
+        }
+        let rest = s.bounds.get(start).and_then(|&a| s.w.get(a..)).unwrap_or_default();
+        let c = &self.compound;
+        // A forbidden stem without a prefix that may end a compound itself or through the suffix
+        // right on it.
+        let starts = |n: usize| rest.char_indices().nth(n).map_or(rest, |(k, _)| rest.get(..k).unwrap_or(rest));
+        let opens = c.forbidden_ends_all || c.forbidden_ends.contains(starts(1)) || c.forbidden_ends.contains(starts(2));
+        let forbidden_end = opens
+            && self.parses(rest, &mut |p| {
+                p.prefix.is_none()
+                    && p.stem.meets(self.forbidden)
+                    && (p.stem | p.suffixes[1].or(p.suffixes[0]).map_or(Mask::EMPTY, |r| r.cont)).meets(c.ends())
+            });
+        let whole = forbidden_end || (!c.pair_heads.is_empty() && self.word_pair(rest, &mut s.budget));
+        s.whole_rests.insert(start, whole);
+        whole
+    }
+
+    /// Is `w`, two adjacent parts, a word of the dictionary written with a space somewhere
+    /// (`vasbeton fal`, `vasbeton falban`)? Then it is that word, written apart, and no compound,
+    /// as with the Hunspell command line. Any listed stem or affixed reading counts, a prefixed
+    /// one too (`ki` + `alma fa`). Only a position where the text before it ends in the first
+    /// word of such a stem (after at most a prefix) is looked up, at one unit of `budget`; with
+    /// none left, `w` counts as such a pair.
+    fn word_pair(&self, w: &str, budget: &mut u32) -> bool {
+        let c = &self.compound;
+        // A cheap test first: such a stem starts the text, after at most a prefix.
+        let opens = |(k, _): (usize, char)| {
+            let rest = w.get(k..).unwrap_or_default();
+            let ends = rest.char_indices().skip(1).map(|(e, _)| e).chain(std::iter::once(rest.len())).take(4);
+            ends.filter_map(|e| rest.get(..e)).any(|t| c.pair_starts.contains(t))
+        };
+        if !c.pair_starts_all && !w.char_indices().take(self.max_pfx_chars + 1).any(opens) {
+            return false;
+        }
+        let at: Vec<usize> = w.char_indices().map(|(k, _)| k).chain(std::iter::once(w.len())).collect();
+        let chars = at.len() - 1;
+        let mut candidate = String::with_capacity(w.len() + 1);
+        for (n, &i) in at.iter().enumerate().take(chars).skip(1) {
+            let (Some(head), Some(tail)) = (w.get(..i), w.get(i..)) else { continue };
+            // A cheap test first: the text before the space ends as some first word does.
+            let ends = (1..=3.min(n)).any(|k| at.get(n - k).and_then(|&e| head.get(e..)).is_some_and(|h| c.pair_head_ends.contains(h)));
+            if !ends {
+                continue;
+            }
+            // The first word starts after at most a prefix and is at most the longest head.
+            let first = n.saturating_sub(c.pair_head_chars)..=self.max_pfx_chars.min(n - 1);
+            if !first.into_iter().any(|j| at.get(j).and_then(|&k| head.get(k..)).is_some_and(|h| c.pair_heads.contains(h))) {
+                continue;
+            }
+            candidate.clear();
+            candidate.push_str(head);
+            candidate.push(' ');
+            if *budget == 0 {
+                return true;
+            }
+            *budget -= 1;
+            candidate.push_str(tail);
+            if self.stem_mask(&candidate).is_some() || self.simple_reading(&candidate, Mask::EMPTY).is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Is `w` a `REP` misspelling of a word: does one replacement turn it into a word without
@@ -697,6 +871,37 @@ impl AffixDict {
         false
     }
 
+    /// Is `w`, the side before a hyphen, a compound once a split into two words of its own is
+    /// allowed, in one of its [`AffixDict::case_readings`]? In a Hungarian dictionary, as with
+    /// the Hunspell command line: `közlésó` is wrong (`közlés` + `ó`), `közlésó-`, `Közlésó-`
+    /// and `közlésó-Filep` are right.
+    fn dash_side(&self, w: &str, deny: Mask, st: &mut Breaks) -> bool {
+        if !self.compound.hungarian {
+            return false;
+        }
+        // A search finds more than `side_ok` did only after a forbidden reading or for a split
+        // into two words of its own.
+        let mut after_forbidden = false;
+        for (v, case_deny) in self.case_readings(w) {
+            if self.stem_mask(&v).is_some_and(|m| m.meets(self.forbidden)) {
+                after_forbidden = true;
+                continue;
+            }
+            if self.simple_reading(&v, deny | case_deny).is_some() || (!after_forbidden && !self.two_words(&v, deny | case_deny)) {
+                continue;
+            }
+            let given = PART_BUDGET.min(st.parts);
+            let mut left = given;
+            let found = self.compound_search(&v, deny | case_deny, &mut left, false);
+            st.parts -= given - left;
+            st.exhausted |= left == 0;
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Is `w` correct when split at a `BREAK` point, both sides checked (each side may break
     /// again)? `^x` and `x$` take `x` off the start or the end.
     pub(super) fn check_breaks(&self, w: &str, deny: Mask, st: &mut Breaks) -> bool {
@@ -722,7 +927,7 @@ impl AffixDict {
             if let Some(x) = b.strip_suffix('$').filter(|x| !x.is_empty()) {
                 if let Some(rest) = w.strip_suffix(x).filter(|r| !r.is_empty()) {
                     st.budget -= 1;
-                    if self.side_ok(rest, deny, st) {
+                    if self.side_ok(rest, deny, st) || (x == "-" && self.dash_side(rest, deny, st)) {
                         return true;
                     }
                 }
@@ -737,7 +942,9 @@ impl AffixDict {
                 // In a Hungarian dictionary the left side of a hyphen may also be a listed word
                 // with the hyphen (`vegyiáru-` + `kereskedés`), as in Hunspell.
                 let dash = || self.compound.hungarian && b == "-" && left.len() < super::MAX_WORD_BYTES;
-                if self.side_ok(right, deny, st) && (self.side_ok(left, deny, st) || (dash() && self.side_ok(&format!("{left}-"), deny, st))) {
+                if self.side_ok(right, deny, st)
+                    && (self.side_ok(left, deny, st) || (dash() && (self.side_ok(&format!("{left}-"), deny, st) || self.dash_side(left, deny, st))))
+                {
                     return true;
                 }
             }
@@ -942,6 +1149,137 @@ ipso facto\t1
         assert!(!AffixDict::from_hunspell(empty_outer, "3\ntata/Y\ntet/Y\ntotu/Yc\n", &[]).unwrap().check("tatatettotuka"));
         let suffixed = "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDWORDMAX 2\nCOMPOUNDSYLLABLE 6 aeiou\nSFX S Y 1\nSFX S 0 ka .\n";
         assert!(AffixDict::from_hunspell(suffixed, "3\ntata/Y\ntet/Y\ntototututututu/YS\n", &[]).unwrap().check("tatatettototututututuka"));
+    }
+
+    /// A pair of parts the dictionary lists with a space is no compound, as with the Hunspell 1.7
+    /// command line (`cpdwordpair_check`).
+    #[test]
+    fn a_pair_listed_with_a_space_is_no_compound() {
+        let aff = "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 2\nSFX S Y 1\nSFX S 0 ban .\n";
+        let d = |dic: &str| AffixDict::from_hunspell(aff, dic, &[]).unwrap();
+        let plain = d("2\nalma/YS\nfa/YS\n");
+        assert!(plain.check("almafa") && plain.check("almafaban"));
+        let pair = d("4\nalma/YS\nfa/YS\nház/YS\nalma fa\n");
+        assert!(!pair.check("almafa") && pair.check("almafaban") && pair.check("faalma"));
+        assert!(!pair.check("házalmafa") && !pair.check("almafaház"), "anywhere in the compound");
+        let inflected = d("3\nalma/YS\nfa/YS\nalma fa/S\n");
+        assert!(!inflected.check("almafa") && !inflected.check("almafaban"));
+        assert!(d("3\nalma/YS\nfa/YS\nalmafa\n").check("almafaban"), "a listed compound stays right");
+    }
+
+    /// A word that splits into two words of its own (anywhere, a short or affixed one too) is a
+    /// compound only as those two, as with the Hunspell 1.7 command line; a forbidden word or a
+    /// compound doesn't count as one of them.
+    #[test]
+    fn two_words_of_their_own_make_a_compound_only_as_two() {
+        let aff = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 3\nSFX S Y 1\nSFX S 0 ot .\n";
+        let parts = "bab/Y\ncec/Y\ndid/Y\nfof/Y\n";
+        let check = |extra: &[&str], w: &str| {
+            let dic = format!("{}\n{parts}{}\n", 4 + extra.len(), extra.join("\n"));
+            AffixDict::from_hunspell(aff, &dic, &[]).unwrap().check(w)
+        };
+        assert!(check(&[], "babcecdid") && check(&[], "babcecdidfof"));
+        // babcec, cecdid or babce + cdid (not at a boundary), ba + bcecdid (shorter than
+        // COMPOUNDMIN), bab + cecdid: two words, and no compound of two.
+        for extra in [&["babcec"][..], &["cecdid"], &["babce", "cdid"], &["ba", "bcecdid"], &["babce/Y", "cdid"], &["babce", "cdid/Y"]] {
+            assert!(!check(extra, "babcecdid"), "{extra:?}");
+        }
+        assert!(check(&["babce/Y", "cdid/Y"], "babcecdid"), "a compound of the two");
+        assert!(check(&["cecdid", "babcec/Y"], "babcecdid"), "bab + cecdid is no compound, babcec + did is");
+        assert!(check(&["babce/!", "cdid"], "babcecdid"), "a forbidden word is none of the two");
+        // In four parts a pair of them is no word of its own beside the rest.
+        for extra in ["babcec", "cecdid", "didfof"] {
+            assert!(check(&[extra], "babcecdidfof"), "{extra}");
+        }
+        assert!(!check(&["babcecdid"], "babcecdidfof") && !check(&["babcec", "didfof"], "babcecdidfof"));
+        // An affixed word counts: darab + ot.
+        let affixed = |w: &str| AffixDict::from_hunspell(aff, "4\ndara/Y\nbot/Y\nhaj/Y\ndarab/S\n", &[]).unwrap().check(w);
+        assert!(affixed("darabot") && !affixed("darabothaj") && !affixed("hajdarabot"));
+    }
+
+    /// In a Hungarian dictionary the side before a hyphen may split into two words of its own:
+    /// `darabothaj` is wrong, `darabothaj-` and `darabothaj-haj` are right.
+    #[test]
+    fn before_a_hyphen_two_words_of_their_own_may_compound() {
+        let aff =
+            "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 3\nSFX S Y 1\nSFX S 0 ot .\nWORDCHARS -\nBREAK 3\nBREAK -\nBREAK ^-\nBREAK -$\n";
+        let dic = "4\ndara/Y\nbot/Y\nhaj/Y\ndarab/S\n";
+        let hu = AffixDict::from_hunspell(&format!("{aff}LANG hu_HU\n"), dic, &[]).unwrap();
+        assert!(!hu.check("darabothaj") && hu.check("darabothaj-") && hu.check("darabothaj-haj"));
+        for w in ["Darabothaj-", "DARABOTHAJ-", "Darabothaj-haj", "DARABOTHAJ-HAJ"] {
+            assert!(hu.check(w), "{w}");
+        }
+        assert!(!hu.check("Darabothaj"));
+        let plain = AffixDict::from_hunspell(aff, dic, &[]).unwrap();
+        assert!(!plain.check("darabothaj-") && plain.check("dara-"));
+    }
+
+    /// A stem with a space checks each part with the next and with the rest of the word, a space
+    /// anywhere in them, a prefixed reading too; a run of parts in the middle isn't checked.
+    #[test]
+    fn a_stem_with_a_space_checks_each_part_with_the_next_and_the_rest() {
+        let aff = "SET UTF-8\nFLAG UTF-8\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 3\nPFX P Y 1\nPFX P 0 ki .\n";
+        let check = |spaced: &str, w: &str| {
+            AffixDict::from_hunspell(aff, &format!("6\nbab/YP\ncec/YP\ndid/YP\nfof/YP\ngug/YP\n{spaced}\n"), &[]).unwrap().check(w)
+        };
+        for spaced in ["bab cec", "cec did", "did fof", "cec didfof", "bab cecdidfof", "ba bcec"] {
+            assert!(!check(spaced, "babcecdidfof"), "{spaced}");
+        }
+        assert!(check("bab cecdid", "babcecdidfof"), "two parts in the middle");
+        assert!(check("cec didfof", "babcecdidfofgug"));
+        assert!(!check("bab cec/P", "kibabcec"), "a prefixed reading");
+    }
+
+    /// A forbidden word that may end a compound ends the search there: `háztanárúr` is wrong
+    /// (`ház` + `tanár` + `úr` would parse), `tanárúrház` and `háztanárúrkert` are right, as with
+    /// the Hunspell 1.7 command line. Without the compound flag it stops nothing.
+    #[test]
+    fn a_forbidden_word_that_may_end_a_compound_ends_it_there() {
+        let aff = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 2\nSFX S Y 1\nSFX S 0 ok .\n";
+        let d = |flags: &str| AffixDict::from_hunspell(aff, &format!("5\nház/Y\ntanár/Y\núr/YS\nkert/Y\ntanárúr/{flags}\n"), &[]).unwrap();
+        let ends = d("!Y");
+        assert!(!ends.check("tanárúr") && !ends.check("háztanárúr"));
+        assert!(ends.check("tanárúrház") && ends.check("háztanárúrkert") && ends.check("háztanárúrok"));
+        let affixed = d("!YS");
+        assert!(!affixed.check("háztanárúrok") && !affixed.check("tanárúrok"));
+        let plain = d("!");
+        assert!(!plain.check("tanárúr") && plain.check("háztanárúr"));
+    }
+
+    /// The quick tests before a forbidden end or a stem with a space miss none of them: a
+    /// forbidden stem that compounds only through a suffix or is one letter long, a prefixed
+    /// forbidden stem (no end), a suffix that strips the stem's start, a prefix that changes it.
+    #[test]
+    fn quick_tests_miss_no_forbidden_end_or_pair() {
+        let check = |aff: &str, dic: &[&str], w: &str| {
+            AffixDict::from_hunspell(&format!("SET UTF-8\nFLAG UTF-8\n{aff}"), &format!("{}\n{}\n", dic.len(), dic.join("\n")), &[]).unwrap().check(w)
+        };
+        let forbid = "FORBIDDENWORD !\nCOMPOUNDFLAG Y\n";
+        assert!(!check(
+            &format!("{forbid}COMPOUNDMIN 2\nSFX S Y 1\nSFX S 0 ok/Y .\n"),
+            &["ház/Y", "tanár/Y", "úr/YS", "kert/Y", "tanárúr/!S", "kitanár/Y"],
+            "háztanárúrok"
+        ));
+        assert!(!check(&format!("{forbid}COMPOUNDMIN 1\nSFX S Y 1\nSFX S 0 bab .\n"), &["ház/Y", "ób/Y", "ab/Y", "ó/!YS"], "házóbab"));
+        assert!(check(
+            &format!("{forbid}COMPOUNDMIN 2\nPFX P Y 1\nPFX P 0 ki .\n"),
+            &["ház/Y", "tanár/YP", "úr/Y", "kert/Y", "tanárúr/!YP", "kifli/!Y"],
+            "házkitanárúr"
+        ));
+        assert!(!check("COMPOUNDFLAG Y\nCOMPOUNDMIN 1\nSFX S Y 1\nSFX S a ák a\n", &["ló/Y", "fa/YS", "ló fa/S"], "lófák"));
+        assert!(!check("COMPOUNDFLAG Y\nCOMPOUNDMIN 1\nPFX C Y 1\nPFX C B b B\n", &["bab/Y", "cec/Y", "Bab cec/C"], "babcec"));
+        // The suffix on the stem decides, not one after it: `ok` + `ra/Y` doesn't end the
+        // compound there, `ok/TY` + `ra` does.
+        let two = |inner: &str, outer: &str| {
+            let aff = format!("{forbid}COMPOUNDMIN 2\nSFX S Y 1\nSFX S 0 {inner} .\nSFX T Y 1\nSFX T 0 {outer} .\n");
+            check(&aff, &["ház/Y", "tanár/Y", "úr/YS", "kert/Y", "tanárúr/!S", "tanya/!Y"], "háztanárúrokra")
+        };
+        assert!(two("ok/T", "ra/Y") && !two("ok/TY", "ra"));
+        // Before a hyphen in any letter case, a forbidden capitalized reading aside.
+        let aff = "LANG hu_HU\nFORBIDDENWORD !\nCOMPOUNDFLAG Y\nCOMPOUNDMIN 3\nWORDCHARS -\nBREAK 3\nBREAK -\nBREAK ^-\nBREAK -$\n";
+        for w in ["Babcecdid-", "BABCECDID-", "Babcecdid-did"] {
+            assert!(check(aff, &["bab/Y", "cec/Y", "did/Y", "Babcecdid/!"], w), "{w}");
+        }
     }
 
     #[test]
