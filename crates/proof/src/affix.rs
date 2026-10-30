@@ -906,9 +906,9 @@ impl AffixDict {
     }
 
     /// Every way `w` is a stem with affixes, within Hunspell's bounds (a prefix; at most two
-    /// suffixes in a row through continuation classes; a prefix with one suffix when the suffix's
-    /// continuation licenses the prefix or both allow cross products), handed to `f` until it
-    /// returns `true`.
+    /// suffixes in a row through continuation classes; a prefix with one or two suffixes when they
+    /// allow cross products and the prefix flag is on the stem or in a suffix's continuation; see
+    /// [`AffixDict::suffix_parses`]), handed to `f` until it returns `true`.
     fn parses(&self, w: &str, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
         if w.is_empty() || w.len() > MAX_WORD_BYTES {
             return false;
@@ -961,8 +961,12 @@ impl AffixDict {
             .flatten()
     }
 
-    /// Parses of `w` as a stem with one suffix, or (without a prefix) two in a row.
+    /// Parses of `w` as a stem with one suffix, or two in a row (also after a prefix).
     fn suffix_parses<'r>(&'r self, w: &str, prefix: Option<&'r Rule>, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
+        // A prefix without cross products takes no suffix at all.
+        if prefix.is_some_and(|p| !p.cross) {
+            return false;
+        }
         let mut root = String::with_capacity(w.len() + 8);
         let mut inner = String::with_capacity(w.len() + 8);
         for (base, g) in self.suffix_splits(w) {
@@ -977,18 +981,19 @@ impl AffixDict {
             for stem in self.entries(root_stem) {
                 for &r1 in &outer {
                     if stem.meets(r1.bit)
-                        && prefix.is_none_or(|p| r1.cont.meets(p.bit) || (p.cross && r1.cross && stem.meets(p.bit)))
+                        && prefix.is_none_or(|p| p.cross && r1.cross && (stem | r1.cont).meets(p.bit))
                         && f(&Parse { stem, prefix, suffixes: [Some(r1), None] })
                     {
                         return true;
                     }
                 }
             }
-            if prefix.is_some() {
-                continue;
-            }
             // Continuation classes: `root` may itself be a stem with a suffix whose continuation
-            // licenses one of the outer rules. Its splits are walked once for all of them.
+            // licenses one of the outer rules. Its splits are walked once for all of them. A prefix
+            // may come with both (`meg` + `rendel` + `és` + `ek`), as the Hunspell command line
+            // shows: the prefix and the outer suffix both cross, and the prefix flag is in the
+            // outer suffix's continuation, or the inner suffix crosses too and the prefix flag is on
+            // the stem or in the inner suffix's continuation.
             for (base2, g2) in self.suffix_splits(&root) {
                 inner.clear();
                 inner.push_str(base2);
@@ -999,8 +1004,10 @@ impl AffixDict {
                         if !stem.meets(r2.bit) || !r2.cond_matches(&inner, true) {
                             continue;
                         }
+                        let inner_licenses = |p: &Rule| r2.cross && (stem | r2.cont).meets(p.bit);
                         for &r1 in &outer {
-                            if r2.cont.meets(r1.bit) && f(&Parse { stem, prefix: None, suffixes: [Some(r1), Some(r2)] }) {
+                            let licensed = prefix.is_none_or(|p| p.cross && r1.cross && (r1.cont.meets(p.bit) || inner_licenses(p)));
+                            if licensed && r2.cont.meets(r1.bit) && f(&Parse { stem, prefix, suffixes: [Some(r1), Some(r2)] }) {
                                 return true;
                             }
                         }
@@ -1765,6 +1772,57 @@ pub(crate) mod tests {
         assert!(d.contains("workable") && d.contains("workables"));
         assert!(!d.contains("workablesx"), "three chained suffixes exceed the limit");
         assert!(!d.forms("work").iter().any(|f| f == "workablesx"));
+    }
+
+    /// `un` + `work` + `able` + `s` under every cross-product setting and every place the prefix
+    /// flag may sit (the stem, the inner or the outer suffix's continuation), checked against the
+    /// Hunspell 1.7 command line: `(unworkable, unworkables)` correct?
+    #[test]
+    fn a_prefix_takes_one_or_two_suffixes_as_hunspell_does() {
+        let cases: [(&str, [bool; 3], bool, bool); 24] = [
+            // (where the prefix flag is, [prefix, inner, outer] cross, unworkable, unworkables)
+            ("stem", [true, true, true], true, true),
+            ("stem", [true, true, false], true, false),
+            ("stem", [true, false, true], false, false),
+            ("stem", [true, false, false], false, false),
+            ("stem", [false, true, true], false, false),
+            ("stem", [false, true, false], false, false),
+            ("stem", [false, false, true], false, false),
+            ("stem", [false, false, false], false, false),
+            ("inner", [true, true, true], true, true),
+            ("inner", [true, true, false], true, false),
+            ("inner", [true, false, true], false, false),
+            ("inner", [true, false, false], false, false),
+            ("inner", [false, true, true], false, false),
+            ("inner", [false, true, false], false, false),
+            ("inner", [false, false, true], false, false),
+            ("inner", [false, false, false], false, false),
+            ("outer", [true, true, true], false, true),
+            ("outer", [true, true, false], false, false),
+            ("outer", [true, false, true], false, true),
+            ("outer", [true, false, false], false, false),
+            ("outer", [false, true, true], false, false),
+            ("outer", [false, true, false], false, false),
+            ("outer", [false, false, true], false, false),
+            ("outer", [false, false, false], false, false),
+        ];
+        let yn = |b: bool| if b { "Y" } else { "N" };
+        for (at, [p, a, b], one, two) in cases {
+            let stem = if at == "stem" { "work/AP" } else { "work/A" };
+            let inner = if at == "inner" { "able/BP" } else { "able/B" };
+            let outer = if at == "outer" { "s/P" } else { "s" };
+            let aff = format!(
+                "SET UTF-8\nFLAG UTF-8\nPFX P {} 1\nPFX P 0 un .\nSFX A {} 1\nSFX A 0 {inner} .\nSFX B {} 1\nSFX B 0 {outer} .\n",
+                yn(p),
+                yn(a),
+                yn(b)
+            );
+            let d = AffixDict::from_hunspell(&aff, &format!("1\n{stem}\n"), &[]).unwrap();
+            let case = format!("prefix flag on {at}, cross {}{}{}", yn(p), yn(a), yn(b));
+            assert_eq!(d.contains("unworkable"), one, "unworkable, {case}");
+            assert_eq!(d.contains("unworkables"), two, "unworkables, {case}");
+            assert!(d.contains("workables"), "{case}");
+        }
     }
 
     #[test]
