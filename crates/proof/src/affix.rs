@@ -255,6 +255,15 @@ impl Parse<'_> {
     }
 }
 
+/// Which suffix counts [`AffixDict::suffix_parses`] and [`AffixDict::prefix_parses`] read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Suffixes {
+    /// None (with a prefix only) or one.
+    One,
+    Two,
+    Both,
+}
+
 /// A stem list with affix rules (see the module docs).
 #[derive(Clone, Debug, Default)]
 pub struct AffixDict {
@@ -906,21 +915,38 @@ impl AffixDict {
     }
 
     /// Every way `w` is a stem with affixes, within Hunspell's bounds (a prefix; at most two
-    /// suffixes in a row through continuation classes; a prefix with one or two suffixes when they
-    /// allow cross products and the prefix flag is on the stem or in a suffix's continuation; see
+    /// suffixes in a row through continuation classes; a prefix with one or two suffixes when the
+    /// prefix and the outer suffix allow cross products and a flag licenses the prefix; see
     /// [`AffixDict::suffix_parses`]), handed to `f` until it returns `true`.
     fn parses(&self, w: &str, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
         if w.is_empty() || w.len() > MAX_WORD_BYTES {
             return false;
         }
-        for stem in self.entries(self.stem_index(w)) {
-            if f(&Parse { stem, prefix: None, suffixes: [None, None] }) {
-                return true;
-            }
+        self.stem_parses(w, f) || self.suffix_parses(w, None, Suffixes::Both, f) || self.prefix_parses(w, Suffixes::Both, f)
+    }
+
+    /// [`AffixDict::parses`] in the order of Hunspell's affix search, step by step: the stem,
+    /// a prefix with at most one suffix, one suffix, two suffixes, a prefix with two. Within a
+    /// step the shorter affix comes first, as there.
+    fn parses_in_steps(&self, w: &str, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
+        if w.is_empty() || w.len() > MAX_WORD_BYTES {
+            return false;
         }
-        if self.suffix_parses(w, None, f) {
-            return true;
-        }
+        self.stem_parses(w, f)
+            || self.prefix_parses(w, Suffixes::One, f)
+            || self.suffix_parses(w, None, Suffixes::One, f)
+            || self.suffix_parses(w, None, Suffixes::Two, f)
+            || self.prefix_parses(w, Suffixes::Two, f)
+    }
+
+    /// `w` as a stem, each homonym a parse.
+    fn stem_parses(&self, w: &str, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
+        self.entries(self.stem_index(w)).any(|stem| f(&Parse { stem, prefix: None, suffixes: [None, None] }))
+    }
+
+    /// Parses of `w` with a prefix: alone and with one suffix (`Suffixes::One`), with two
+    /// (`Suffixes::Two`), or all of them.
+    fn prefix_parses(&self, w: &str, suffixes: Suffixes, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
         let mut root = String::with_capacity(w.len() + 8);
         // Each split point from the start: the appended prefix is `w[..b]`, found in the index.
         let cuts = std::iter::once(0).chain(w.char_indices().skip(1).map(|(i, _)| i)).take(self.max_pfx_chars + 1);
@@ -935,12 +961,14 @@ impl AffixDict {
             if !p.cond_matches(&root, false) {
                 continue;
             }
-            for stem in self.entries(self.stem_index(&root)) {
-                if stem.meets(p.bit) && f(&Parse { stem, prefix: Some(p), suffixes: [None, None] }) {
-                    return true;
+            if suffixes != Suffixes::Two {
+                for stem in self.entries(self.stem_index(&root)) {
+                    if stem.meets(p.bit) && f(&Parse { stem, prefix: Some(p), suffixes: [None, None] }) {
+                        return true;
+                    }
                 }
             }
-            if self.suffix_parses(&root, Some(p), f) {
+            if self.suffix_parses(&root, Some(p), suffixes, f) {
                 return true;
             }
         }
@@ -961,8 +989,9 @@ impl AffixDict {
             .flatten()
     }
 
-    /// Parses of `w` as a stem with one suffix, or two in a row (also after a prefix).
-    fn suffix_parses<'r>(&'r self, w: &str, prefix: Option<&'r Rule>, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
+    /// Parses of `w` as a stem with one suffix, two in a row, or either (`suffixes`), also after
+    /// a prefix.
+    fn suffix_parses<'r>(&'r self, w: &str, prefix: Option<&'r Rule>, suffixes: Suffixes, f: &mut dyn FnMut(&Parse<'_>) -> bool) -> bool {
         // A prefix without cross products takes no suffix at all.
         if prefix.is_some_and(|p| !p.cross) {
             return false;
@@ -977,7 +1006,7 @@ impl AffixDict {
             if outer.is_empty() {
                 continue;
             }
-            let root_stem = self.stem_index(&root);
+            let root_stem = self.stem_index(&root).filter(|_| suffixes != Suffixes::Two);
             for stem in self.entries(root_stem) {
                 for &r1 in &outer {
                     if stem.meets(r1.bit)
@@ -994,6 +1023,9 @@ impl AffixDict {
             // shows: the prefix and the outer suffix both cross, and the prefix flag is in the
             // outer suffix's continuation, or the inner suffix crosses too and the prefix flag is on
             // the stem or in the inner suffix's continuation.
+            if suffixes == Suffixes::One {
+                continue;
+            }
             for (base2, g2) in self.suffix_splits(&root) {
                 inner.clear();
                 inner.push_str(base2);
@@ -1018,12 +1050,13 @@ impl AffixDict {
         false
     }
 
-    /// Is this parse a word on its own? Not when its stem is `FORBIDDENWORD`, in `deny`, or
-    /// `ONLYINCOMPOUND`; not a bare `NEEDAFFIX` stem; not when the outermost affix still needs
-    /// another (`NEEDAFFIX` in its continuation) or an affix may only stand inside compounds.
-    fn standalone(&self, p: &Parse<'_>, deny: Mask) -> bool {
+    /// Does Hunspell's affix search stop at this parse, a word on its own unless its stem is
+    /// `FORBIDDENWORD`? Not when its stem is in `deny` or `ONLYINCOMPOUND`; not a bare `NEEDAFFIX`
+    /// stem; not when the outermost affix still needs another (`NEEDAFFIX` in its continuation) or
+    /// an affix may only stand inside compounds.
+    fn stands(&self, p: &Parse<'_>, deny: Mask) -> bool {
         let c = &self.compound;
-        if p.stem.meets(self.forbidden | deny | c.only_in) {
+        if p.stem.meets(deny | c.only_in) {
             return false;
         }
         if !p.affixed() && p.stem.meets(c.need_affix) {
@@ -1032,9 +1065,21 @@ impl AffixDict {
         !p.outer_cont().meets(c.need_affix) && !p.conts().meets(c.only_in)
     }
 
-    /// Is `w` (normalized) a word without compounding: a stem or an affixed form of one?
-    fn simple(&self, w: &str, deny: Mask) -> bool {
-        self.parses(w, &mut |p| self.standalone(p, deny))
+    /// How `w` (normalized) reads without compounding. Hunspell's affix search stops at the
+    /// first reading it meets ([`AffixDict::parses_in_steps`]): `Some(true)` when that is a word,
+    /// `Some(false)` when its stem is `FORBIDDENWORD`, so no later reading counts (`megfedés` +
+    /// `emben` is wrong, though `meg` + `fed` + `és` + `emben` parses) and neither does a
+    /// compound. `None`: no reading.
+    fn simple_reading(&self, w: &str, deny: Mask) -> Option<bool> {
+        let mut first = None;
+        self.parses_in_steps(w, &mut |p| {
+            if !self.stands(p, deny) {
+                return false;
+            }
+            first = Some(!p.stem.meets(self.forbidden));
+            true
+        });
+        first
     }
 
     /// Is `w` (normalized, case as written) a word: listed and not forbidden, an affixed form,
@@ -1047,10 +1092,20 @@ impl AffixDict {
     /// [`AffixDict::is_word`], the compound search spending `budget` (shared by every reading of
     /// one word).
     fn is_word_in(&self, w: &str, deny: Mask, budget: &mut u32) -> bool {
+        self.word_reading(w, deny, budget) == Some(true)
+    }
+
+    /// [`AffixDict::is_word_in`], telling a forbidden word (`Some(false)`: a listed
+    /// `FORBIDDENWORD`, or an affixed reading of one, [`AffixDict::simple_reading`]) from one that
+    /// is no word at all (`None`).
+    fn word_reading(&self, w: &str, deny: Mask, budget: &mut u32) -> Option<bool> {
         if self.stem_mask(w).is_some_and(|m| m.meets(self.forbidden)) {
-            return false;
+            return Some(false);
         }
-        self.simple(w, deny) || self.compound_word(w, deny, budget)
+        match self.simple_reading(w, deny) {
+            None => self.compound_word(w, deny, budget).then_some(true),
+            reading => reading,
+        }
     }
 
     /// Is `w` exactly (case and all) a stem, an affixed form of one or a compound? `ICONV` and
@@ -1122,22 +1177,20 @@ impl AffixDict {
     }
 
     /// Is one of the [`AffixDict::case_readings`] of `w` (normalized) a word? `Some(false)` when
-    /// a reading met first is a listed `FORBIDDENWORD`: then the word is wrong and isn't split
-    /// either, as in Hunspell (`ijs` and `Ijs/W`: `Ijs` and `IJS` are wrong; `alma-fa/W`:
-    /// `Alma-fa` is). `None` when no reading is a word. Each reading's compound search gets its
-    /// own [`compound::PART_BUDGET`], taken from what is left for the word.
+    /// a reading met first is a listed `FORBIDDENWORD` or an affixed form of one: then the word
+    /// is wrong and isn't split either, as in Hunspell (`ijs` and `Ijs/W`: `Ijs` and `IJS` are
+    /// wrong; `alma-fa/W`: `Alma-fa` is; `vasbeton-fal/!B`: `vasbeton-falban` is wrong). `None`
+    /// when no reading is a word. Each reading's compound search gets its own
+    /// [`compound::PART_BUDGET`], taken from what is left for the word.
     fn check_case(&self, w: &str, deny: Mask, breaks: &mut compound::Breaks) -> Option<bool> {
         for (v, case_deny) in self.case_readings(w) {
-            if self.stem_mask(&v).is_some_and(|m| m.meets(self.forbidden)) {
-                return Some(false);
-            }
             let given = compound::PART_BUDGET.min(breaks.parts);
             let mut left = given;
-            let found = self.is_word_in(&v, deny | case_deny, &mut left);
+            let found = self.word_reading(&v, deny | case_deny, &mut left);
             breaks.parts -= given - left;
             breaks.exhausted |= left == 0;
-            if found {
-                return Some(true);
+            if found.is_some() {
+                return found;
             }
         }
         None
@@ -1207,10 +1260,13 @@ impl AffixDict {
         // A form whose outer affix needs another one is no word; one through an affix that may
         // stand only inside compounds is none either, nor anything built on it.
         let outer_ok = |r: &Rule| !r.cont.meets(c.need_affix);
-        let mut cross_sfx = Vec::new();
-        // Suffix forms queued with the continuation classes they carry, for chained expansion;
-        // each (form, classes) pair is expanded once.
-        let mut chain: Vec<(String, Mask)> = Vec::new();
+        // Suffix forms a prefix may join, each with the flags that license one there (the
+        // rules of [`AffixDict::suffix_parses`]).
+        let mut cross_sfx: Vec<(String, Mask)> = Vec::new();
+        // Suffix forms queued with the continuation classes they carry and the prefix flags they
+        // license as an inner suffix, for chained expansion; each (form, classes) pair is
+        // expanded once.
+        let mut chain: Vec<(String, Mask, Mask)> = Vec::new();
         let mut queued: std::collections::HashSet<(String, Mask)> = std::collections::HashSet::new();
         let mut work = 0usize;
         for r in &self.suffixes {
@@ -1222,11 +1278,12 @@ impl AffixDict {
                 continue;
             }
             let form = format!("{base}{}", r.add);
+            let licenses = if r.cross { f | r.cont } else { Mask::EMPTY };
             if r.cross && outer_ok(r) {
-                cross_sfx.push(form.clone());
+                cross_sfx.push((form.clone(), licenses));
             }
             if !r.cont.is_empty() && queued.insert((form.clone(), r.cont)) {
-                chain.push((form.clone(), r.cont));
+                chain.push((form.clone(), r.cont, licenses));
             }
             if outer_ok(r) {
                 out.push(form);
@@ -1242,7 +1299,7 @@ impl AffixDict {
             if level.is_empty() {
                 break;
             }
-            for (form, flags) in level {
+            for (form, flags, inner) in level {
                 for r in self.suffixes_with(flags).into_iter().filter_map(|i| self.suffixes.get(i as usize)) {
                     work += 1;
                     if work > MAX_FORMS_WORK {
@@ -1256,8 +1313,11 @@ impl AffixDict {
                         continue;
                     }
                     let next = format!("{base}{}", r.add);
+                    if r.cross && outer_ok(r) {
+                        cross_sfx.push((next.clone(), r.cont | inner));
+                    }
                     if !r.cont.is_empty() && queued.insert((next.clone(), r.cont)) {
-                        chain.push((next.clone(), r.cont));
+                        chain.push((next.clone(), r.cont, Mask::EMPTY));
                     }
                     if outer_ok(r) {
                         out.push(next);
@@ -1269,23 +1329,23 @@ impl AffixDict {
             }
         }
         for r in &self.prefixes {
-            if !f.meets(r.bit) || !r.cond_matches(stem, false) {
+            if !r.cond_matches(stem, false) {
                 continue;
             }
             let Some(rest) = stem.strip_prefix(&*r.strip) else { continue };
             if r.cont.meets(c.only_in) {
                 continue;
             }
-            if outer_ok(r) {
+            if f.meets(r.bit) && outer_ok(r) {
                 out.push(format!("{}{rest}", r.add));
             }
             if r.cross {
-                for s in &cross_sfx {
+                for (s, licenses) in &cross_sfx {
                     work += 1;
                     if out.len() >= MAX_FORMS || work > MAX_FORMS_WORK {
                         return out;
                     }
-                    if let Some(rest) = s.strip_prefix(&*r.strip) {
+                    if let Some(rest) = s.strip_prefix(&*r.strip).filter(|_| licenses.meets(r.bit)) {
                         out.push(format!("{}{rest}", r.add));
                     }
                 }
@@ -1822,7 +1882,77 @@ pub(crate) mod tests {
             assert_eq!(d.contains("unworkable"), one, "unworkable, {case}");
             assert_eq!(d.contains("unworkables"), two, "unworkables, {case}");
             assert!(d.contains("workables"), "{case}");
+            // Suggestions list the same forms.
+            let forms = d.forms("work");
+            assert_eq!(forms.iter().any(|f| f == "unworkable"), one, "forms, unworkable, {case}");
+            assert_eq!(forms.iter().any(|f| f == "unworkables"), two, "forms, unworkables, {case}");
         }
+    }
+
+    /// A forbidden stem found by an earlier step of the affix search makes the word wrong, however
+    /// a later step or a compound reads it, as with the Hunspell 1.7 command line.
+    #[test]
+    fn a_forbidden_reading_at_an_earlier_step_makes_the_word_wrong() {
+        let chain = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nPFX P Y 1\nPFX P 0 un .\nSFX A Y 1\nSFX A 0 able/BP .\nSFX B Y 1\nSFX B 0 s .\n";
+        let one_s = format!("{chain}SFX C Y 1\nSFX C 0 s .\n");
+        let ables = format!("{chain}SFX C Y 1\nSFX C 0 ables .\n");
+        let cases: [(&str, &str, &[&str], &[&str]); 6] = [
+            // (aff, dic, correct, wrong)
+            (&one_s, "2\nwork/AP\nunworkable/!C\n", &["workables"], &["unworkables", "unworkable"]),
+            (&one_s, "2\nwork/AP\nworkable/!C\n", &["unworkables"], &["workables", "workable"]),
+            (&one_s, "2\nwork/AP\nunworkable/!\n", &["unworkables"], &["unworkable"]),
+            (&one_s, "2\nwork/AP\nworkables/!\n", &["unworkables"], &["workables"]),
+            (&ables, "2\nwork/AP\nunwork/!C\n", &["unworkable"], &["unworkables", "unwork"]),
+            (&ables, "2\nwork/AP\nwork/!C\n", &["unworkables"], &["workables"]),
+        ];
+        for (aff, dic, correct, wrong) in cases {
+            let d = AffixDict::from_hunspell(aff, dic, &[]).unwrap();
+            for w in correct {
+                assert!(d.contains(w), "{w} with {dic:?}");
+            }
+            for w in wrong {
+                assert!(!d.contains(w), "{w} with {dic:?}");
+            }
+        }
+        // A prefix comes before a suffix, and a shorter affix before a longer one: the first
+        // reading found decides.
+        let aff = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nPFX P Y 1\nPFX P 0 un .\nSFX S Y 1\nSFX S 0 b .\n";
+        assert!(!AffixDict::from_hunspell(aff, "2\nab/!P\nuna/S\n", &[]).unwrap().contains("unab"));
+        assert!(AffixDict::from_hunspell(aff, "2\nab/P\nuna/!S\n", &[]).unwrap().contains("unab"));
+        let aff = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nSFX S Y 1\nSFX S 0 c .\nSFX T Y 1\nSFX T 0 bc .\n";
+        assert!(!AffixDict::from_hunspell(aff, "2\nab/!S\na/T\n", &[]).unwrap().contains("abc"));
+        assert!(!AffixDict::from_hunspell(aff, "2\na/T\nab/!S\n", &[]).unwrap().contains("abc"));
+        assert!(AffixDict::from_hunspell(aff, "2\nab/S\na/!T\n", &[]).unwrap().contains("abc"));
+        let aff = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nPFX P Y 1\nPFX P 0 x .\nPFX Q Y 1\nPFX Q 0 xy .\n";
+        assert!(!AffixDict::from_hunspell(aff, "2\nyab/!P\nab/Q\n", &[]).unwrap().contains("xyab"));
+        assert!(AffixDict::from_hunspell(aff, "2\nyab/P\nab/!Q\n", &[]).unwrap().contains("xyab"));
+        // Nor is it split at a break, nor read in lower case after a forbidden capitalized
+        // reading.
+        let aff = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nWORDCHARS -\nBREAK 1\nBREAK -\nSFX B Y 1\nSFX B 0 ban .\n";
+        let d = AffixDict::from_hunspell(aff, "3\nvasbeton-fal/!B\nvasbeton\nfalban\n", &[]).unwrap();
+        for w in ["vasbeton-falban", "Vasbeton-falban", "VASBETON-FALBAN"] {
+            assert!(!d.check(w), "{w}");
+        }
+        assert!(d.check("vasbeton") && d.check("falban"));
+        let d = AffixDict::from_hunspell(aff, "2\nAlma/!B\nalma/B\n", &[]).unwrap();
+        assert!(d.check("almaban"));
+        assert!(!d.check("Almaban") && !d.check("ALMABAN"));
+        // Nor is the word a compound then.
+        let aff = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nCOMPOUNDFLAG Z\nCOMPOUNDMIN 2\nSFX D Y 1\nSFX D 0 d .\n";
+        assert!(!AffixDict::from_hunspell(aff, "3\nhouse/!D\nhou/Z\nsed/Z\n", &[]).unwrap().contains("housed"));
+        assert!(AffixDict::from_hunspell(aff, "3\nhouse/D\nhou/Z\nsed/Z\n", &[]).unwrap().contains("housed"));
+        assert!(AffixDict::from_hunspell(aff, "2\nhou/Z\nsed/Z\n", &[]).unwrap().contains("housed"));
+        // A REP replacement that gives any listed or affixed word, a forbidden one too, makes a
+        // compound a misspelling (`CHECKCOMPOUNDREP`).
+        let aff = "SET UTF-8\nFLAG UTF-8\nFORBIDDENWORD !\nNEEDAFFIX N\nCOMPOUNDFLAG Z\nCOMPOUNDMIN 2\nCHECKCOMPOUNDREP\nREP 1\nREP x y\nSFX S Y 1\nSFX S 0 s .\n";
+        for (dic, w) in [
+            ("3\nfoox/Z\nbar/Z\nfooybar/!\n", "fooxbar"),
+            ("3\nfoox/Z\nbar/Z\nfooybar/N\n", "fooxbar"),
+            ("3\nfoox/Z\nbars/Z\nfooybar/!S\n", "fooxbars"),
+        ] {
+            assert!(!AffixDict::from_hunspell(aff, dic, &[]).unwrap().contains(w), "{w} with {dic:?}");
+        }
+        assert!(AffixDict::from_hunspell(aff, "2\nfoox/Z\nbar/Z\n", &[]).unwrap().contains("fooxbar"));
     }
 
     #[test]

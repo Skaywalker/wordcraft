@@ -619,7 +619,10 @@ impl AffixDict {
                     return true;
                 }
                 *budget -= 1;
-                if self.simple(&format!("{head}{to}{tail}"), Mask::EMPTY) {
+                // Any listed stem or affixed reading counts, a forbidden one too, as in
+                // Hunspell's `candidate_check`.
+                let candidate = format!("{head}{to}{tail}");
+                if self.stem_mask(&candidate).is_some() || self.simple_reading(&candidate, Mask::EMPTY).is_some() {
                     return true;
                 }
             }
