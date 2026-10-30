@@ -76,11 +76,12 @@ writes new documents in Hungarian.
   marks. The affix engine reads the dictionary's flag aliases, compounding rules and word breaks,
   so compounds (`almafa`, `házkulcsban`), the 6–3 rule for long ones, and hyphenated forms
   (`SMS-ben`, `Petőfi-vers`) are checked as Hunspell checks them, a verbal prefix with two suffixes
-  too (`megrendelések`, `díjbekérőt`): on 31,248 test words labelled by the Hunspell command line,
-  the results agree on 99.8%. Abbreviations the dictionary lists with
-  their period (`pl.`, `stb.`, `kb.`) are correct with it and wrong without it, and take their
-  endings after a hyphen (`Kft.-ben`, `szept.-ben`). An ending after a sign is checked with the
-  sign, as the dictionary lists it (`27%-os`, `§-ában`, `5 °C-on`, `€-ért`).
+  too (`megrendelések`, `díjbekérőt`), and a forbidden word stays wrong with endings
+  (`megfedésemben`). Against labels from the Hunspell command line the results agree on 99.8% of
+  31,248 test words and on 99.9% of the 49,742 most frequent Hungarian words. Abbreviations the
+  dictionary lists with their period (`pl.`, `stb.`, `kb.`) are correct with it and wrong without
+  it, and take their endings after a hyphen (`Kft.-ben`, `szept.-ben`). An ending after a sign is
+  checked with the sign, as the dictionary lists it (`27%-os`, `§-ában`, `5 °C-on`, `€-ért`).
 - **Suggestions**: missing accents first (`hazban` → `házban`), the dictionary's confusion table
   (`hejesírás` → `helyesírás`), a missing space (`nemis` → `nem is`), one typo, then a stem scan.
   Words the dictionary marks `NOSUGGEST` or `SUBSTANDARD`, and compound-only parts, are never
@@ -112,7 +113,7 @@ and contain no data from either.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-30 | trivial | An ending after a sign is checked with it (`27%-os`, `§-ával`, `°C-on`): it was marked alone |
-| 2026-10-30 | trivial | A verbal prefix with two suffixes is a word (`megrendelések`, `visszaigazolások`), its cross products as the Hunspell command line licenses them |
+| 2026-10-30 | trivial | A verbal prefix with two suffixes is a word (`megrendelések`, `visszaigazolások`), its cross products as the Hunspell command line licenses them; a forbidden stem found with fewer affixes still makes the word wrong (`megfedésemben`) |
 | 2026-10-23 | trivial | The catalog moved to storytold/craft-i18n (`locales/hu/wordcraft.tsv`) |
 | 2026-10-23 | trivial | Lookup, context, template, style-name and command-search tests use inline fixture catalogs or the pseudo-language; tests that asserted one language's catalog wording removed |
 | 2026-10-23 | trivial | Interface-language tests: a missing translation falls back to English and never fails a test; `cargo xtask i18n-report` (part of `cargo xtask ci`) prints the strings each language lacks; single-language coverage tests removed |
