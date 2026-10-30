@@ -46,7 +46,7 @@ SFX R 0 -ban .
 ";
 
 /// Stems (the count line first, as in Hunspell files).
-pub const DIC: &str = "62
+pub const DIC: &str = "66
 ház/YA
 alma/YA
 fa/YA
@@ -108,6 +108,10 @@ Kft./R
 Charles
 ócska/!A
 kertész/YO
+%-os
+§-ban
+°C-on
+€-ért
 ";
 
 /// Install the test dictionary as the Hungarian one.

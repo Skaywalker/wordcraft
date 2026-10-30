@@ -99,9 +99,16 @@ fn is_latin_letter(c: char) -> bool {
     c.is_alphabetic() && (c < '\u{0250}' || ('\u{1E00}'..='\u{1EFF}').contains(&c))
 }
 
+/// Is `c` a sign hu_HU lists with its endings (`%-os`, `‰-es`, `§-ával`, `°C-on`, `€-ért`, `$-t`)?
+/// Other punctuation before a word (`(`, `„`) is no part of it.
+fn is_sign(c: char) -> bool {
+    matches!(c, '%' | '‰' | '§' | '°' | '€' | '$')
+}
+
 /// The texts the word at `a..b` of `text` is checked as, any of which may be correct; empty: the
-/// word alone. An ending after an abbreviation (`ben` in `Kft.-ben.`) is checked with the
-/// abbreviation, so a wrong ending is marked alone. The abbreviation is checked with its ending
+/// word alone. A word right after a sign, or after a sign and a hyphen, is checked with the sign
+/// (`os` of `27%-os`, `C-on` of `5 °C-on`), which word splitting leaves out. An ending after an
+/// abbreviation (`ben` in `Kft.-ben.`) is checked with the abbreviation, so a wrong ending is marked alone. The abbreviation is checked with its ending
 /// or else with its period alone (`Kft.` in `Kft.-bem` is right); a word before a period with it
 /// (`pl.`, an abbreviation the dictionary may list with it).
 pub(crate) fn spelling_spans(text: &str, a: usize, b: usize) -> Vec<(usize, usize)> {
@@ -116,6 +123,11 @@ pub(crate) fn spelling_spans(text: &str, a: usize, b: usize) -> Vec<(usize, usiz
     }
     let rest = text.get(b..).unwrap_or("");
     let mut out = Vec::new();
+    // A sign with an ending: `ával` in `§-ával`, `os` in `27%-os`, `C-on` in `°C-on`.
+    let sign_before = |end: usize| text.get(..end)?.chars().next_back().filter(|&c| is_sign(c)).map(|c| end - c.len_utf8());
+    if let Some(s) = text.get(..a).and_then(|t| t.strip_suffix('-')).and_then(|t| sign_before(t.len())).or_else(|| sign_before(a)) {
+        out.push((s, b));
+    }
     if rest.starts_with(".-")
         && let Some(end) = word_end(b + 2).filter(|&e| e > b + 2)
     {
@@ -154,7 +166,9 @@ pub fn is_correct_with(d: &AffixDict, word: &str) -> bool {
         return true; // other scripts: no dictionary
     }
     let abbreviation = word.trim_end().ends_with('.') && d.check(&format!("{w}."));
-    if abbreviation || d.check(w) || crate::in_user_dictionary(&w.to_lowercase()) {
+    // A sign with its ending, as the dictionary lists it (`%-os`, `§-ával`): trimming took the sign.
+    let signed = || word.trim().starts_with(is_sign) && d.check(word.trim());
+    if abbreviation || d.check(w) || signed() || crate::in_user_dictionary(&w.to_lowercase()) {
         return true;
     }
     // A hyphenated word with a part from the user dictionary: the other parts must be words.
@@ -259,6 +273,28 @@ mod tests {
         let text = "A Kft.-bam szép.";
         let marked: Vec<&str> = crate::check_spelling_in(text, crate::ProofLang::Hu).iter().map(|i| &text[i.start..i.end]).collect();
         assert_eq!(marked, ["bam"]);
+    }
+
+    #[test]
+    fn signs_take_the_endings_the_dictionary_lists() {
+        // `27%-os`, `§-ban`, `°C-on` and `€-ért` are words of the dictionary, as with the Hunspell
+        // command line: the ending isn't checked alone. A wrong ending is marked alone.
+        test_dict::install();
+        let marks = |text: &str| -> Vec<String> {
+            crate::check_spelling_in(text, crate::ProofLang::Hu).iter().map(|i| text[i.start..i.end].to_string()).collect()
+        };
+        assert!(marks("A 27%-os ház, a 2. §-ban, 5 °C-on és 9 €-ért.").is_empty());
+        assert!(marks("§-ban és €-ért.").is_empty(), "a sign at the start of the text");
+        assert!(is_correct("%-os") && is_correct("§-ban") && is_correct("€-ért"));
+        assert!(!is_correct("%-ox"));
+        assert_eq!(spelling_spans("27%-os x", 4, 6), [(2, 6)]);
+        assert_eq!(spelling_spans("5 °C-on", 4, 8), [(2, 8)]);
+        assert_eq!(spelling_spans("€-ért", 4, 8), [(0, 8)], "a multi-byte sign at the start of the text");
+        assert_eq!(marks("A 27%-ox ház és a §-bam."), ["ox", "bam"]);
+        // Punctuation before a word is no sign: the word alone is checked, a typo stays marked.
+        assert!(spelling_spans("a (ház", 3, 6).is_empty() && spelling_spans("„-ház", 4, 7).is_empty());
+        assert_eq!(marks("A (hazx) és „hazx”."), ["hazx", "hazx"]);
+        assert!(marks("A (ház) és „ház”.").is_empty());
     }
 
     #[test]
