@@ -5,6 +5,7 @@
 /// Hungarian dictionary, and the suggestion tables the Hungarian suggestions use (`TRY`, `MAP`
 /// for accents, `REP` for common confusions).
 pub const AFF: &str = "SET UTF-8
+LANG hu_HU
 TRY aeoiulznrstkmbhgdáéíóöőúüűvjpfcy
 MAP 5
 MAP aá

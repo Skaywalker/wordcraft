@@ -278,6 +278,15 @@ mod tests {
     }
 
     #[test]
+    fn long_compounds_follow_the_six_three_rule() {
+        // Past two words a compound may have six syllables: `almafaház` has four,
+        // `almafaházkulcsasztal` seven.
+        test_dict::install();
+        assert!(is_correct("almafaház") && is_correct("házkulcs"));
+        assert!(!is_correct("almafaházkulcsasztal"));
+    }
+
+    #[test]
     fn signs_take_the_endings_the_dictionary_lists() {
         // `27%-os`, `§-ban`, `°C-on` and `€-ért` are words of the dictionary, as with the Hunspell
         // command line: the ending isn't checked alone. A wrong ending is marked alone.
