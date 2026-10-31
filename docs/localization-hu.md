@@ -1,6 +1,6 @@
 # Hungarian interface
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-31 · **Change:** trivial (a verbal prefix with two suffixes, an ending after a sign, long compounds with -hoz and -i, word pairs listed with a space; previously trivial: abbreviations with their period, no NOSUGGEST suggestions, fewer false comma and space marks; previously minor: Hungarian proofing: spelling, suggestions, grammar, hyphenation; previously trivial: the catalog moved to storytold/craft-i18n, `locales/hu/wordcraft.tsv`; previously trivial: interface-language tests: a missing translation never fails a test, `cargo xtask i18n-report` in `cargo xtask ci` prints the strings each language lacks, and lookup and template tests use inline fixture catalogs or the pseudo-language; previously trivial: the interface audit lists missing Hungarian entries instead of failing; previously minor: Hungarian interface catalog and regression checks) · **Target:** WordCraft 0.5.0
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-31 · **Change:** trivial (a verbal prefix with two suffixes, an ending after a sign, long compounds with -hoz and -i, word pairs listed with a space, fused adjectives before a hyphen; previously trivial: abbreviations with their period, no NOSUGGEST suggestions, fewer false comma and space marks; previously minor: Hungarian proofing: spelling, suggestions, grammar, hyphenation; previously trivial: the catalog moved to storytold/craft-i18n, `locales/hu/wordcraft.tsv`; previously trivial: interface-language tests: a missing translation never fails a test, `cargo xtask i18n-report` in `cargo xtask ci` prints the strings each language lacks, and lookup and template tests use inline fixture catalogs or the pseudo-language; previously trivial: the interface audit lists missing Hungarian entries instead of failing; previously minor: Hungarian interface catalog and regression checks) · **Target:** WordCraft 0.5.0
 
 Choose **File › Options › Interface language › Magyar**, or follow a Hungarian system display
 language (`hu-HU`, `hu_HU.UTF-8`). The catalog code is `hu`; `ui.language` with `{"value":"hu"}`
@@ -81,7 +81,10 @@ writes new documents in Hungarian.
   (`adóvégrehajtáshoz`, `nyugdíjbiztosítási`). A word that splits into two words of its own is
   a compound only as those two (`műanyagcső` is wrong, `műanyagcsőgyár` right; before a hyphen
   it may still be, `közlésó-`), and a stem the dictionary lists with a space keeps its parts
-  from compounding (`vasbeton fal`: `vasbetonfal` is wrong, `vasbetonfalelem` right). Against
+  from compounding (`vasbeton fal`: `vasbetonfal` is wrong, `vasbetonfalelem` right). Before a
+  hyphen a compound may start with a fused adjective (`forgalmiadó-hiány`) or a first part
+  with a suffix (`jövedékiadó-fizetési`), and the 6–3 rule doesn't apply there; the last two
+  parts may not be one stem twice, its forms included (`házházban`, `házbanház-`). Against
   labels from the Hunspell command line the results agree on 99.9% of 31,248 test words and of
   the 49,742 most frequent Hungarian words. Abbreviations the dictionary lists with their period
   (`pl.`, `stb.`, `kb.`) are correct with it and wrong without it, and take their endings after a
@@ -117,6 +120,7 @@ and contain no data from either.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-31 | trivial | Before a hyphen a compound may start with a fused adjective (`forgalmiadó-hiány`) or a suffixed first part (`jövedékiadó-fizetési`, `jövedékiadóház-ügy`) and the 6–3 rule doesn't apply; these were marked. The last two parts may not be one stem twice, its forms included (`házházban`) |
 | 2026-10-31 | trivial | Compounds as Hunspell checks them: a word that splits into two words of its own is a compound only as those two (`műanyagcső`, `darabothaj`), a stem with a space keeps its parts from compounding (`vasbetonfal`, `féláron`, `hajnyírógép`), and a forbidden word ends a compound (`háztanárúr`); these were accepted |
 | 2026-10-30 | trivial | Long compounds count syllables for the 6–3 rule as Hunspell does: three-word compounds ending in `-hoz` or `-i` (`adóvégrehajtáshoz`, `nyugdíjbiztosítási`, `leltárértékelésiben`) were marked |
 | 2026-10-30 | trivial | An ending after a sign is checked with it (`27%-os`, `§-ával`, `°C-on`): it was marked alone |
