@@ -249,6 +249,12 @@ impl Parse<'_> {
         self.prefix.iter().copied().chain(self.suffix_rules()).fold(Mask::EMPTY, |m, r| m | r.cont)
     }
 
+    /// Continuation classes of the affix Hunspell checks a compound part's flags on, with the
+    /// stem's: the inner of two suffixes, else the suffix, else the prefix.
+    fn checked_cont(&self) -> Mask {
+        self.suffixes[1].or(self.suffixes[0]).or(self.prefix).map_or(Mask::EMPTY, |r| r.cont)
+    }
+
     /// Continuation classes of the outermost affix (the outer suffix, else the prefix).
     fn outer_cont(&self) -> Mask {
         self.suffixes[0].or(self.prefix).map_or(Mask::EMPTY, |r| r.cont)
