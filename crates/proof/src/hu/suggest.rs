@@ -282,71 +282,15 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     // 3. Common confusions.
     col.compound_checks = COMPOUND_CHECKS;
     col.part_lookups = ROUND_PART_LOOKUPS;
-    for (from, to) in d.rep() {
-        if from.is_empty() {
-            continue;
-        }
-        for (i, _) in input.match_indices(from.as_str()) {
-            if let (Some(a), Some(b)) = (input.get(..i), input.get(i + from.len()..)) {
-                col.offer(&format!("{a}{to}{b}"), COST_REP);
-            }
-        }
-    }
-    // 4. A missing space: cheap after a short leading word or before a short trailing one,
-    //    dearer between two longer words, never leaving a stray short half.
+    rep_round(&mut col, &input);
+    // 4. A missing space.
     col.compound_checks = COMPOUND_CHECKS;
     col.part_lookups = ROUND_PART_LOOKUPS;
-    for (i, _) in input.char_indices().skip(1) {
-        let (Some(a), Some(b)) = (input.get(..i), input.get(i..)) else { continue };
-        let long = |p: &str| p.chars().count() >= 3;
-        let cost = if (LEADING_WORDS.contains(&a) && long(b)) || (long(a) && TRAILING_WORDS.contains(&b)) {
-            COST_SPLIT
-        } else if long(a) && long(b) {
-            COST_SPLIT_RARE
-        } else {
-            continue;
-        };
-        col.offer(&format!("{a} {b}"), cost);
-    }
+    split_round(&mut col, &input);
     // 5. One typo, as Hunspell looks for them: plain words first; compound readings only when no
     //    plain word was found in any round (`orommel` gets `örömmel`, not `orom` + `mell`).
     col.compound_checks = 0;
-    let mut typos: Vec<(String, u32)> = Vec::new();
-    let mut letters: Vec<char> = d.try_chars().chars().filter(|c| c.is_lowercase()).collect();
-    if letters.is_empty() {
-        letters = "aeoiulznrstkmbhgdáéíóöőúüűvjpfcy".chars().collect();
-    }
-    let s = |v: &[char]| v.iter().collect::<String>();
-    for i in 0..n.saturating_sub(1) {
-        if chars.get(i) != chars.get(i + 1) {
-            let mut v = chars.clone();
-            v.swap(i, i + 1);
-            typos.push((s(&v), COST_SWAP));
-        }
-    }
-    for i in 0..n {
-        let mut v = chars.clone();
-        v.remove(i);
-        typos.push((s(&v), COST_DROP_OR_ADD));
-    }
-    for i in 0..=n {
-        for &c in &letters {
-            let mut v = chars.clone();
-            v.insert(i, c);
-            typos.push((s(&v), COST_DROP_OR_ADD));
-        }
-    }
-    for i in 0..n {
-        for &c in &letters {
-            if chars.get(i) != Some(&c) {
-                let mut v = chars.clone();
-                if let Some(x) = v.get_mut(i) {
-                    *x = c;
-                }
-                typos.push((s(&v), COST_MISTYPE));
-            }
-        }
-    }
+    let typos = one_typo(d, &chars);
     for (cand, cost) in &typos {
         col.offer(cand, *cost);
     }
@@ -364,6 +308,87 @@ pub fn suggest_in(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     }
     let mut found: Vec<(String, (u32, usize))> = col.found.into_iter().collect();
     found.sort_by_key(|(_, k)| *k);
+    in_case(found, case, word, max)
+}
+
+/// Round 3: the dictionary's `REP` pairs, each at every place it matches.
+fn rep_round(col: &mut Collector, input: &str) {
+    let d = col.d;
+    for (from, to) in d.rep() {
+        if from.is_empty() {
+            continue;
+        }
+        for (i, _) in input.match_indices(from.as_str()) {
+            if let (Some(a), Some(b)) = (input.get(..i), input.get(i + from.len()..)) {
+                col.offer(&format!("{a}{to}{b}"), COST_REP);
+            }
+        }
+    }
+}
+
+/// Round 4: a missing space, cheap after a short leading word or before a short trailing one,
+/// dearer between two longer words, never leaving a stray short half.
+fn split_round(col: &mut Collector, input: &str) {
+    for (i, _) in input.char_indices().skip(1) {
+        let (Some(a), Some(b)) = (input.get(..i), input.get(i..)) else { continue };
+        let long = |p: &str| p.chars().count() >= 3;
+        let cost = if (LEADING_WORDS.contains(&a) && long(b)) || (long(a) && TRAILING_WORDS.contains(&b)) {
+            COST_SPLIT
+        } else if long(a) && long(b) {
+            COST_SPLIT_RARE
+        } else {
+            continue;
+        };
+        col.offer(&format!("{a} {b}"), cost);
+    }
+}
+
+/// Round 5's candidates: every word one typo away (a swap, a dropped or added letter, a
+/// mistyped one), with its cost.
+fn one_typo(d: &AffixDict, chars: &[char]) -> Vec<(String, u32)> {
+    let n = chars.len();
+    let mut typos: Vec<(String, u32)> = Vec::new();
+    let mut letters: Vec<char> = d.try_chars().chars().filter(|c| c.is_lowercase()).collect();
+    if letters.is_empty() {
+        letters = "aeoiulznrstkmbhgdáéíóöőúüűvjpfcy".chars().collect();
+    }
+    let s = |v: &[char]| v.iter().collect::<String>();
+    for i in 0..n.saturating_sub(1) {
+        if chars.get(i) != chars.get(i + 1) {
+            let mut v = chars.to_vec();
+            v.swap(i, i + 1);
+            typos.push((s(&v), COST_SWAP));
+        }
+    }
+    for i in 0..n {
+        let mut v = chars.to_vec();
+        v.remove(i);
+        typos.push((s(&v), COST_DROP_OR_ADD));
+    }
+    for i in 0..=n {
+        for &c in &letters {
+            let mut v = chars.to_vec();
+            v.insert(i, c);
+            typos.push((s(&v), COST_DROP_OR_ADD));
+        }
+    }
+    for i in 0..n {
+        for &c in &letters {
+            if chars.get(i) != Some(&c) {
+                let mut v = chars.to_vec();
+                if let Some(x) = v.get_mut(i) {
+                    *x = c;
+                }
+                typos.push((s(&v), COST_MISTYPE));
+            }
+        }
+    }
+    typos
+}
+
+/// The suggestions in the word's letter case, best first, without the word itself, at most `max`.
+fn in_case(found: Vec<(String, (u32, usize))>, case: Casing, word: &str, max: usize) -> Vec<String> {
+    let n = word.chars().count();
     let mut out: Vec<String> = Vec::new();
     for (text, _) in found {
         let t = match case {
